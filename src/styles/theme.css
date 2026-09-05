@@ -1,0 +1,46 @@
+:root {
+  --bg-0: #0b1412;
+  --bg-1: #10201c;
+  --bg-2: #16302a;
+  --ink: #e8f2ee;
+  --muted: #9bb5ab;
+  --accent: #2dd4a8;
+  --accent-2: #1aa884;
+  --danger: #ff7b72;
+  --line: rgba(232, 242, 238, 0.12);
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+  --radius: 18px;
+  --font-display: "Outfit", "Noto Sans SC", sans-serif;
+  --font-body: "Noto Sans SC", "Outfit", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  font-family: var(--font-body);
+  color: var(--ink);
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(45, 212, 168, 0.18), transparent 55%),
+    radial-gradient(900px 500px at 100% 0%, rgba(26, 168, 132, 0.12), transparent 50%),
+    linear-gradient(165deg, var(--bg-0), var(--bg-1) 45%, #0d1a17);
+  background-attachment: fixed;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+a {
+  color: var(--accent);
+}
