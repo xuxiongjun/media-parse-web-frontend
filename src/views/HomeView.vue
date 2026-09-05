@@ -15,14 +15,17 @@ const input = ref('')
 const loading = ref(false)
 const result = ref<ParseResult | null>(null)
 
-const canSubmit = computed(() => input.value.trim().length > 0 && !loading.value)
+const hasInput = computed(() => input.value.trim().length > 0)
+const canSubmit = computed(() => hasInput.value && !loading.value)
 
-async function onParse() {
-  if (!canSubmit.value) return
+async function onParse(text?: string) {
+  const url = (text ?? input.value).trim()
+  if (!url || loading.value) return
+  input.value = url
   loading.value = true
   result.value = null
   try {
-    result.value = await parseShareUrl(input.value.trim())
+    result.value = await parseShareUrl(url)
     message.success('解析成功')
   } catch (err) {
     let tip = '解析失败，请稍后重试'
@@ -39,6 +42,24 @@ async function onParse() {
 function onClear() {
   input.value = ''
   result.value = null
+}
+
+async function onPasteAndSearch() {
+  if (loading.value) return
+  try {
+    if (!navigator.clipboard?.readText) {
+      message.warning('当前环境不支持读取剪贴板，请手动粘贴后解析')
+      return
+    }
+    const text = (await navigator.clipboard.readText()).trim()
+    if (!text) {
+      message.warning('剪贴板为空，请先复制分享链接')
+      return
+    }
+    await onParse(text)
+  } catch {
+    message.error('读取剪贴板失败，请检查浏览器权限或手动粘贴')
+  }
 }
 
 function onDownload() {
@@ -74,10 +95,27 @@ function onKeydown(e: KeyboardEvent) {
           @keydown="onKeydown"
         />
         <div class="actions">
-          <NButton quaternary @click="onClear" :disabled="loading || (!input && !result)">
+          <NButton v-if="hasInput" quaternary :disabled="loading" @click="onClear">
             清空
           </NButton>
-          <NButton type="primary" size="large" :loading="loading" :disabled="!canSubmit" @click="onParse">
+          <NButton
+            v-else
+            type="primary"
+            size="large"
+            :loading="loading"
+            :disabled="loading"
+            @click="onPasteAndSearch"
+          >
+            粘贴并搜索
+          </NButton>
+          <NButton
+            v-if="hasInput"
+            type="primary"
+            size="large"
+            :loading="loading"
+            :disabled="!canSubmit"
+            @click="() => onParse()"
+          >
             开始解析
           </NButton>
         </div>
