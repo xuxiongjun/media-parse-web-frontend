@@ -23,6 +23,16 @@ const themeOverrides: GlobalThemeOverrides = {
     placeholderColor: '#7f9a90',
     textColor: '#e8f2ee',
     caretColor: '#2dd4a8'
+  },
+  Progress: {
+    fillColor: '#2dd4a8',
+    railColor: 'rgba(232, 242, 238, 0.12)',
+    textColorInside: '#0b1412'
+  },
+  Collapse: {
+    titleTextColor: '#e8f2ee',
+    arrowColor: '#9bb5ab',
+    dividerColor: 'transparent'
   }
 }
 </script>
