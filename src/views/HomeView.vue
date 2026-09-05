@@ -21,6 +21,7 @@ import {
   type ApiErrorBody,
   type ParseResult
 } from '../api/parse'
+import { canUseDirectoryPicker, saveUrlsToPickedFolder } from '../api/folderDownload'
 
 type ItemStatus = 'idle' | 'parsing' | 'done' | 'error'
 
@@ -37,6 +38,8 @@ const draft = ref('')
 const queue = ref<QueueItem[]>([])
 const loading = ref(false)
 const downloadingAll = ref(false)
+const downloadSaveDone = ref(0)
+const downloadSaveTotal = ref(0)
 const progressDone = ref(0)
 const progressTotal = ref(0)
 const expandedNames = ref<string[]>([])
@@ -291,11 +294,54 @@ async function downloadUrlsSequentially(urls: string[], gapMs = 450) {
   }
 }
 
+/** 优先选文件夹写入；不支持时降级为逐个触发浏览器下载 */
+async function saveUrlsPreferFolder(proxyUrls: string[]): Promise<void> {
+  const urls = proxyUrls.map((u) => mediaDownloadUrl(u))
+  downloadSaveDone.value = 0
+  downloadSaveTotal.value = urls.length
+
+  if (canUseDirectoryPicker()) {
+    const outcome = await saveUrlsToPickedFolder(urls, {
+      onProgress: (p) => {
+        downloadSaveDone.value = p.done
+        downloadSaveTotal.value = p.total
+      }
+    })
+    if (outcome.mode === 'folder' && outcome.cancelled) {
+      message.info('已取消选择文件夹')
+      return
+    }
+    if (outcome.mode === 'folder') {
+      if (outcome.fail === 0) {
+        message.success(`已保存 ${outcome.ok} 个文件到所选文件夹`)
+      } else if (outcome.ok === 0) {
+        message.error(`保存失败（${outcome.fail} 个）`)
+      } else {
+        message.warning(`已保存 ${outcome.ok} 个，失败 ${outcome.fail} 个`)
+      }
+      return
+    }
+  }
+
+  message.info('当前浏览器不支持选文件夹，将逐个触发下载（可能需允许「多个下载」）')
+  await downloadUrlsSequentially(proxyUrls)
+  message.success(`已触发下载（${proxyUrls.length} 个文件）`)
+}
+
 async function onDownloadAllImages(result: ParseResult) {
   const images = result.imageProxyUrls ?? []
   if (!images.length) return
-  await downloadUrlsSequentially(images)
-  message.success(`已触发 ${images.length} 张图片下载`)
+  if (downloadingAll.value) return
+  downloadingAll.value = true
+  try {
+    await saveUrlsPreferFolder(images)
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '批量保存失败')
+  } finally {
+    downloadingAll.value = false
+    downloadSaveDone.value = 0
+    downloadSaveTotal.value = 0
+  }
 }
 
 async function onDownloadAll() {
@@ -307,10 +353,13 @@ async function onDownloadAll() {
   if (downloadingAll.value) return
   downloadingAll.value = true
   try {
-    await downloadUrlsSequentially(urls)
-    message.success(`已触发全部下载（${urls.length} 个文件）`)
+    await saveUrlsPreferFolder(urls)
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '批量保存失败')
   } finally {
     downloadingAll.value = false
+    downloadSaveDone.value = 0
+    downloadSaveTotal.value = 0
   }
 }
 
@@ -454,7 +503,12 @@ function retryOne(item: QueueItem) {
               :disabled="!downloadableCount || downloadingAll || loading"
               @click="onDownloadAll"
             >
-              下载全部{{ downloadableCount ? `（${downloadableCount}）` : '' }}
+              <template v-if="downloadingAll && downloadSaveTotal">
+                保存中 {{ downloadSaveDone }}/{{ downloadSaveTotal }}
+              </template>
+              <template v-else>
+                下载全部{{ downloadableCount ? `（${downloadableCount}）` : '' }}
+              </template>
             </NButton>
             <NButton size="small" quaternary @click="expandAll">全部展开</NButton>
             <NButton size="small" quaternary @click="collapseAll">全部折叠</NButton>
@@ -489,7 +543,12 @@ function retryOne(item: QueueItem) {
                   <p v-if="item.result.author" class="author">作者：{{ item.result.author }}</p>
                   <div class="batch-actions">
                     <NButton strong secondary @click="onCopyTitle(item.result)">复制标题文案</NButton>
-                    <NButton type="primary" @click="onDownloadAllImages(item.result)">
+                    <NButton
+                      type="primary"
+                      :loading="downloadingAll"
+                      :disabled="downloadingAll"
+                      @click="onDownloadAllImages(item.result)"
+                    >
                       保存所有图片
                     </NButton>
                   </div>
