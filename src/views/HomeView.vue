@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   NButton,
   NCollapse,
@@ -43,6 +43,10 @@ const downloadSaveTotal = ref(0)
 const progressDone = ref(0)
 const progressTotal = ref(0)
 const expandedNames = ref<string[]>([])
+const showBackTop = ref(false)
+
+/** 单次批量上限，避免过长列表拖垮页面与接口 */
+const MAX_QUEUE = 99
 
 let idSeq = 0
 function nextId() {
@@ -65,6 +69,7 @@ function collectDownloadUrls(): string[] {
 
 const hasDraft = computed(() => draft.value.trim().length > 0)
 const hasQueue = computed(() => queue.value.length > 0)
+const queueAtLimit = computed(() => queue.value.length >= MAX_QUEUE)
 const progressPercent = computed(() => {
   if (!progressTotal.value) return 0
   return Math.round((progressDone.value / progressTotal.value) * 100)
@@ -75,6 +80,34 @@ const doneItems = computed(() => queue.value.filter((i) => i.status === 'done' |
 const downloadableCount = computed(() => collectDownloadUrls().length)
 const highlightId = ref<string | null>(null)
 let highlightTimer: number | undefined
+
+/** 超过上限时截取前 MAX_QUEUE 条，并提示未写入数量 */
+function takeEntriesWithCap(entries: string[]): string[] {
+  if (entries.length <= MAX_QUEUE) return entries
+  const dropped = entries.length - MAX_QUEUE
+  message.warning(
+    `一次最多 ${MAX_QUEUE} 条，已写入前 ${MAX_QUEUE} 条，超出 ${dropped} 条未添加`
+  )
+  return entries.slice(0, MAX_QUEUE)
+}
+
+function onWindowScroll() {
+  showBackTop.value = window.scrollY > 360
+}
+
+function scrollToTop() {
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+onMounted(() => {
+  window.addEventListener('scroll', onWindowScroll, { passive: true })
+  onWindowScroll()
+})
+
+onUnmounted(() => {
+  window.removeEventListener('scroll', onWindowScroll)
+  if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
+})
 
 /** 仅自动展开新完成的条目，保留用户手动折叠状态 */
 watch(
@@ -103,16 +136,23 @@ function makeItem(raw: string): QueueItem {
 }
 
 function syncQueueFromDraft() {
-  const entries = collectShareEntries(draft.value)
-  if (!entries.length) {
+  const collected = collectShareEntries(draft.value)
+  if (!collected.length) {
     message.warning('未识别到有效链接，请检查粘贴内容')
     return
   }
+  const entries = takeEntriesWithCap(collected)
   queue.value = entries.map(makeItem)
-  message.success(`已整理 ${entries.length} 条链接`)
+  if (collected.length <= MAX_QUEUE) {
+    message.success(`已整理 ${entries.length} 条链接`)
+  }
 }
 
 function addEmptyRow() {
+  if (queue.value.length >= MAX_QUEUE) {
+    message.warning(`列表最多 ${MAX_QUEUE} 条`)
+    return
+  }
   queue.value.push(makeItem(''))
 }
 
@@ -180,6 +220,18 @@ function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
+/** 批量解析间隔：避免触发本后端限流，并减轻上游平台压力 */
+const BATCH_GAP_MS = 550
+const RATE_LIMIT_BACKOFF_MS = 3500
+const RATE_LIMIT_MAX_RETRY = 2
+
+function isRateLimited(err: unknown): boolean {
+  if (!axios.isAxiosError(err)) return false
+  if (err.response?.status === 429) return true
+  const data = err.response?.data as ApiErrorBody | undefined
+  return data?.code === 'RATE_LIMIT'
+}
+
 function errMessage(err: unknown): string {
   if (axios.isAxiosError(err)) {
     const data = err.response?.data as ApiErrorBody | undefined
@@ -198,13 +250,23 @@ async function parseOne(item: QueueItem) {
   }
   item.status = 'parsing'
   item.error = null
-  try {
-    item.result = await parseShareUrl(raw)
-    item.status = 'done'
-  } catch (err) {
-    item.result = null
-    item.status = 'error'
-    item.error = errMessage(err)
+  let attempt = 0
+  while (true) {
+    try {
+      item.result = await parseShareUrl(raw)
+      item.status = 'done'
+      return
+    } catch (err) {
+      if (isRateLimited(err) && attempt < RATE_LIMIT_MAX_RETRY) {
+        attempt += 1
+        await sleep(RATE_LIMIT_BACKOFF_MS * attempt)
+        continue
+      }
+      item.result = null
+      item.status = 'error'
+      item.error = errMessage(err)
+      return
+    }
   }
 }
 
@@ -212,12 +274,16 @@ async function onBatchParse() {
   if (loading.value) return
 
   if (!queue.value.length) {
-    const entries = collectShareEntries(draft.value)
-    if (!entries.length) {
+    const collected = collectShareEntries(draft.value)
+    if (!collected.length) {
       message.warning('请先粘贴链接，或整理到下方列表')
       return
     }
-    queue.value = entries.map(makeItem)
+    queue.value = takeEntriesWithCap(collected).map(makeItem)
+  } else if (queue.value.length > MAX_QUEUE) {
+    const dropped = queue.value.length - MAX_QUEUE
+    queue.value = queue.value.slice(0, MAX_QUEUE)
+    message.warning(`列表最多 ${MAX_QUEUE} 条，已截取前 ${MAX_QUEUE} 条，超出 ${dropped} 条未保留`)
   }
 
   const targets = queue.value.filter((i) => i.raw.trim())
@@ -239,7 +305,7 @@ async function onBatchParse() {
     for (let i = 0; i < targets.length; i++) {
       await parseOne(targets[i])
       progressDone.value = i + 1
-      if (i < targets.length - 1) await sleep(280)
+      if (i < targets.length - 1) await sleep(BATCH_GAP_MS)
     }
     await nextTick()
     const ok = successCount.value
@@ -442,7 +508,7 @@ async function retryFailed() {
     for (let i = 0; i < targets.length; i++) {
       await parseOne(targets[i])
       progressDone.value = i + 1
-      if (i < targets.length - 1) await sleep(280)
+      if (i < targets.length - 1) await sleep(BATCH_GAP_MS)
     }
     await nextTick()
     const stillFail = targets.filter((i) => i.status === 'error').length
@@ -470,7 +536,7 @@ async function retryFailed() {
       <section class="panel">
         <div class="panel-head">
           <label class="label" for="share-input">批量粘贴</label>
-          <span class="hint-inline">每行一条分享文案或链接 · Ctrl/⌘ + Enter 开始</span>
+          <span class="hint-inline">每行一条 · 最多 {{ MAX_QUEUE }} 条 · Ctrl/⌘ + Enter 开始</span>
         </div>
         <NInput
           id="share-input"
@@ -503,7 +569,7 @@ async function retryFailed() {
 
       <section v-if="hasQueue" class="panel queue-panel">
         <div class="panel-head">
-          <p class="label">待解析列表</p>
+          <p class="label">待解析列表（{{ queue.length }}/{{ MAX_QUEUE }}）</p>
           <div class="panel-head-actions">
             <NButton
               v-if="failCount > 0"
@@ -524,7 +590,14 @@ async function retryFailed() {
             >
               重试失败（{{ failCount }}）
             </NButton>
-            <NButton size="tiny" quaternary :disabled="loading" @click="addEmptyRow">添加一行</NButton>
+            <NButton
+              size="tiny"
+              quaternary
+              :disabled="loading || queueAtLimit"
+              @click="addEmptyRow"
+            >
+              添加一行
+            </NButton>
           </div>
         </div>
         <div class="queue-table" role="table">
@@ -741,6 +814,16 @@ async function retryFailed() {
         <p>仅供学习与个人备份有权内容。请遵守平台协议与版权法规，勿用于未授权传播。</p>
       </footer>
     </main>
+
+    <button
+      v-show="showBackTop"
+      type="button"
+      class="back-top"
+      aria-label="回到顶部"
+      @click="scrollToTop"
+    >
+      ↑
+    </button>
   </div>
 </template>
 
@@ -1112,9 +1195,46 @@ async function retryFailed() {
   line-height: 1.55;
 }
 
+.back-top {
+  position: fixed;
+  right: 20px;
+  bottom: 24px;
+  z-index: 40;
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(16, 32, 28, 0.92);
+  color: var(--accent);
+  font-size: 1.15rem;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+  transition: color 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+}
+
+.back-top:hover {
+  color: #45e0b6;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  transform: translateY(-2px);
+}
+
+.back-top:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 @media (max-width: 768px) {
   .page {
     padding: 20px 12px 32px;
+  }
+
+  .back-top {
+    right: 14px;
+    bottom: 18px;
+    width: 40px;
+    height: 40px;
   }
 
   .result {
