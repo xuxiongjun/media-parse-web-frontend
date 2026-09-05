@@ -73,13 +73,23 @@ const successCount = computed(() => queue.value.filter((i) => i.status === 'done
 const failCount = computed(() => queue.value.filter((i) => i.status === 'error').length)
 const doneItems = computed(() => queue.value.filter((i) => i.status === 'done' || i.status === 'error'))
 const downloadableCount = computed(() => collectDownloadUrls().length)
+const highlightId = ref<string | null>(null)
+let highlightTimer: number | undefined
 
+/** 仅自动展开新完成的条目，保留用户手动折叠状态 */
 watch(
-  doneItems,
-  (items) => {
-    expandedNames.value = items.map((i) => i.id)
-  },
-  { deep: true }
+  () => doneItems.value.map((i) => i.id),
+  (ids, prevIds = []) => {
+    const prev = new Set(prevIds)
+    const newlyDone = ids.filter((id) => !prev.has(id))
+    if (newlyDone.length) {
+      const open = new Set(expandedNames.value)
+      for (const id of newlyDone) open.add(id)
+      expandedNames.value = [...open]
+    }
+    const keep = new Set(ids)
+    expandedNames.value = expandedNames.value.filter((id) => keep.has(id))
+  }
 )
 
 function makeItem(raw: string): QueueItem {
@@ -116,6 +126,31 @@ function onClear() {
   progressDone.value = 0
   progressTotal.value = 0
   expandedNames.value = []
+  highlightId.value = null
+  if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
+}
+
+async function locateResult(item: QueueItem) {
+  if (item.status !== 'done' && item.status !== 'error') {
+    message.warning('该条尚未出现在解析结果中')
+    return
+  }
+  if (!expandedNames.value.includes(item.id)) {
+    expandedNames.value = [...expandedNames.value, item.id]
+  }
+  await nextTick()
+  const anchor = document.getElementById(`result-${item.id}`)
+  const el = (anchor?.closest('.n-collapse-item') as HTMLElement | null) ?? anchor
+  if (!el) {
+    message.warning('未找到对应结果，请稍后再试')
+    return
+  }
+  el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  highlightId.value = item.id
+  if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
+  highlightTimer = window.setTimeout(() => {
+    if (highlightId.value === item.id) highlightId.value = null
+  }, 1600)
 }
 
 function shortUrl(raw: string): string {
@@ -285,6 +320,18 @@ function onCopyTitle(result: ParseResult) {
 function onCopyImageLink(proxyUrl: string) {
   const absolute = new URL(proxyUrl, window.location.origin).href
   copyText(absolute, '图片链接已复制')
+}
+
+function copyFailedTexts() {
+  const texts = queue.value
+    .filter((i) => i.status === 'error')
+    .map((i) => i.raw.trim())
+    .filter(Boolean)
+  if (!texts.length) {
+    message.warning('没有可复制的失败文案')
+    return
+  }
+  copyText(texts.join('\n'), `已复制 ${texts.length} 条失败文案`)
 }
 
 async function downloadUrlsSequentially(urls: string[], gapMs = 450) {
@@ -461,6 +508,15 @@ async function retryFailed() {
             <NButton
               v-if="failCount > 0"
               size="tiny"
+              secondary
+              :disabled="loading"
+              @click="copyFailedTexts"
+            >
+              复制失败文案（{{ failCount }}）
+            </NButton>
+            <NButton
+              v-if="failCount > 0"
+              size="tiny"
               type="warning"
               secondary
               :disabled="loading"
@@ -502,6 +558,14 @@ async function retryFailed() {
             </span>
             <span class="col-act">
               <button
+                v-if="item.status === 'done' || item.status === 'error'"
+                type="button"
+                class="link-btn"
+                @click="locateResult(item)"
+              >
+                查看
+              </button>
+              <button
                 type="button"
                 class="link-btn"
                 :disabled="loading || queue.length <= 1"
@@ -540,6 +604,15 @@ async function retryFailed() {
             <NButton
               v-if="failCount > 0"
               size="small"
+              secondary
+              :disabled="loading"
+              @click="copyFailedTexts"
+            >
+              复制失败文案（{{ failCount }}）
+            </NButton>
+            <NButton
+              v-if="failCount > 0"
+              size="small"
               type="warning"
               secondary
               :disabled="loading"
@@ -573,6 +646,14 @@ async function retryFailed() {
             :name="item.id"
             :title="panelTitle(item, index)"
           >
+            <template #header-extra>
+              <span
+                :id="`result-${item.id}`"
+                class="result-anchor"
+                :class="{ 'is-target': highlightId === item.id }"
+                aria-hidden="true"
+              />
+            </template>
             <div v-if="item.status === 'error'" class="error-body">
               <p>{{ item.error || '解析失败' }}</p>
               <p class="error-url">{{ shortUrl(item.raw) }}</p>
@@ -762,9 +843,9 @@ async function retryFailed() {
 
 .queue-row {
   display: grid;
-  grid-template-columns: 36px minmax(0, 1fr) 72px 52px;
-  gap: 10px;
-  align-items: start;
+  grid-template-columns: 40px minmax(0, 1fr) 64px auto;
+  gap: 12px;
+  align-items: center;
 }
 
 .queue-head {
@@ -772,18 +853,35 @@ async function retryFailed() {
   font-size: 0.8rem;
   padding: 0 2px 4px;
   border-bottom: 1px solid var(--line);
+  align-items: end;
 }
 
 .col-idx,
 .col-status,
 .col-act {
-  padding-top: 6px;
   color: var(--muted);
   font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.col-idx {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.col-status {
+  display: flex;
+  justify-content: center;
+  align-items: center;
 }
 
 .col-act {
-  text-align: right;
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
 }
 
 .progress-panel {
@@ -846,6 +944,21 @@ async function retryFailed() {
   box-shadow: var(--shadow);
   margin-bottom: 12px;
   overflow: hidden;
+  scroll-margin-top: 16px;
+  transition: box-shadow 0.35s ease, border-color 0.35s ease;
+}
+
+.results-wrap :deep(.n-collapse-item:has(.result-anchor.is-target)) {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent), var(--shadow);
+}
+
+.result-anchor {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
 }
 
 .results-wrap :deep(.n-collapse-item__header) {
@@ -972,8 +1085,9 @@ async function retryFailed() {
   background: transparent;
   color: var(--accent);
   cursor: pointer;
-  padding: 4px 0;
-  font-size: 0.9rem;
+  padding: 0;
+  font-size: 0.85rem;
+  line-height: 1.4;
 }
 
 .link-btn:hover:not(:disabled) {
@@ -1024,6 +1138,7 @@ async function retryFailed() {
     grid-template-areas:
       'idx raw'
       'status act';
+    align-items: center;
   }
 
   .col-idx {
@@ -1036,6 +1151,7 @@ async function retryFailed() {
 
   .col-status {
     grid-area: status;
+    justify-content: flex-start;
   }
 
   .col-act {
