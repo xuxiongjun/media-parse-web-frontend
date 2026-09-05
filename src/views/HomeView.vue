@@ -38,6 +38,14 @@ interface DownloadFailItem {
   url: string
   label: string
   reason: string
+  /** 对应队列中的分享文案 / 链接，便于复制 */
+  raw?: string
+}
+
+interface DownloadJob {
+  url: string
+  label: string
+  raw?: string
 }
 
 const message = useMessage()
@@ -66,24 +74,27 @@ function nextId() {
   return `item-${idSeq}`
 }
 
-function collectDownloadJobs(): Array<{ url: string; label: string }> {
-  const jobs: Array<{ url: string; label: string }> = []
+function collectDownloadJobs(): DownloadJob[] {
+  const jobs: DownloadJob[] = []
   queue.value.forEach((item, index) => {
     if (item.status !== 'done' || !item.result) return
     const num = index + 1
     const title = item.result.title?.trim() || shortUrl(item.raw)
+    const raw = item.raw.trim()
     if (isImageResult(item.result)) {
       const images = item.result.imageProxyUrls ?? []
       images.forEach((url, imgIndex) => {
         jobs.push({
           url,
-          label: `#${num} · 图${imgIndex + 1}/${images.length} · ${title}`
+          label: `#${num} · 图${imgIndex + 1}/${images.length} · ${title}`,
+          raw
         })
       })
     } else if (item.result.videoProxyUrl) {
       jobs.push({
         url: item.result.videoProxyUrl,
-        label: `#${num} · 视频 · ${title}`
+        label: `#${num} · 视频 · ${title}`,
+        raw
       })
     }
   })
@@ -438,6 +449,22 @@ function copyFailedTexts() {
   copyText(texts.join('\n'), `已复制 ${texts.length} 条失败文案`)
 }
 
+function copyDownloadFailedTexts() {
+  const texts: string[] = []
+  const seen = new Set<string>()
+  for (const item of downloadFailList.value) {
+    const text = item.raw?.trim()
+    if (!text || seen.has(text)) continue
+    seen.add(text)
+    texts.push(text)
+  }
+  if (!texts.length) {
+    message.warning('没有可复制的下载失败文案')
+    return
+  }
+  copyText(texts.join('\n'), `已复制 ${texts.length} 条下载失败文案`)
+}
+
 async function downloadUrlsSequentially(urls: string[], gapMs = 450) {
   for (let i = 0; i < urls.length; i++) {
     downloadProxy(urls[i])
@@ -448,10 +475,7 @@ async function downloadUrlsSequentially(urls: string[], gapMs = 450) {
 }
 
 /** 本轮尝试后同步失败重试列表：成功的移出，仍失败的写入/更新 */
-function syncDownloadFailsAfterSave(
-  attempted: Array<{ url: string; label?: string }>,
-  failed: DownloadFailItem[]
-) {
+function syncDownloadFailsAfterSave(attempted: DownloadJob[], failed: DownloadFailItem[]) {
   const attemptedSet = new Set(attempted.map((a) => a.url))
   const kept = downloadFailList.value.filter((i) => !attemptedSet.has(i.url))
   downloadFailList.value = [...kept, ...failed]
@@ -466,10 +490,8 @@ function removeDownloadFail(url: string) {
 }
 
 /** 优先选文件夹写入；不支持时降级为逐个触发浏览器下载 */
-async function saveUrlsPreferFolder(
-  jobs: Array<{ url: string; label?: string }> | string[]
-): Promise<void> {
-  const items = jobs.map((j) => (typeof j === 'string' ? { url: j } : j))
+async function saveUrlsPreferFolder(jobs: DownloadJob[] | string[]): Promise<void> {
+  const items: DownloadJob[] = jobs.map((j) => (typeof j === 'string' ? { url: j, label: '' } : j))
   const proxyUrls = items.map((j) => j.url)
   downloadSaveDone.value = 0
   downloadSaveTotal.value = items.length
@@ -502,7 +524,8 @@ async function saveUrlsPreferFolder(
         return {
           url: orig?.url ?? f.url,
           label: f.label || orig?.label || '',
-          reason: f.reason
+          reason: f.reason,
+          raw: orig?.raw
         }
       })
       syncDownloadFailsAfterSave(items, failedJobs)
@@ -529,12 +552,15 @@ async function onDownloadAllImages(result: ParseResult) {
   const images = result.imageProxyUrls ?? []
   if (!images.length) return
   if (downloadingAll.value) return
+  const owner = queue.value.find((i) => i.result === result)
+  const raw = owner?.raw.trim() || undefined
   downloadingAll.value = true
   try {
     await saveUrlsPreferFolder(
       images.map((url, i) => ({
         url,
-        label: `图${i + 1}/${images.length} · ${result.title?.trim() || '未命名图文'}`
+        label: `图${i + 1}/${images.length} · ${result.title?.trim() || '未命名图文'}`,
+        raw
       }))
     )
   } catch (err) {
@@ -570,7 +596,11 @@ async function onDownloadAll() {
 }
 
 async function retryDownloadFailed() {
-  const jobs = downloadFailList.value.map((i) => ({ url: i.url, label: i.label }))
+  const jobs = downloadFailList.value.map((i) => ({
+    url: i.url,
+    label: i.label,
+    raw: i.raw
+  }))
   if (!jobs.length) {
     message.warning('当前没有下载失败项')
     return
@@ -594,7 +624,7 @@ async function retryOneDownload(item: DownloadFailItem) {
   if (downloadingAll.value) return
   downloadingAll.value = true
   try {
-    await saveUrlsPreferFolder([{ url: item.url, label: item.label }])
+    await saveUrlsPreferFolder([{ url: item.url, label: item.label, raw: item.raw }])
   } catch (err) {
     message.error(err instanceof Error ? err.message : '重试保存失败')
   } finally {
@@ -863,6 +893,9 @@ async function retryFailed() {
           <div class="download-fail-head">
             <p class="download-fail-title">下载失败重试列表（{{ downloadFailCount }}）</p>
             <div class="download-fail-actions">
+              <NButton size="tiny" secondary @click="copyDownloadFailedTexts">
+                复制失败文案
+              </NButton>
               <NButton
                 size="tiny"
                 quaternary
