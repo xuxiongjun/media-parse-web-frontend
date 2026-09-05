@@ -378,6 +378,35 @@ function retryOne(item: QueueItem) {
       loading.value = false
     })
 }
+
+async function retryFailed() {
+  if (loading.value) return
+  const targets = queue.value.filter((i) => i.status === 'error')
+  if (!targets.length) {
+    message.warning('当前没有失败项')
+    return
+  }
+
+  loading.value = true
+  progressDone.value = 0
+  progressTotal.value = targets.length
+
+  try {
+    for (let i = 0; i < targets.length; i++) {
+      await parseOne(targets[i])
+      progressDone.value = i + 1
+      if (i < targets.length - 1) await sleep(280)
+    }
+    await nextTick()
+    const stillFail = targets.filter((i) => i.status === 'error').length
+    const recovered = targets.length - stillFail
+    if (recovered && !stillFail) message.success(`全部重试成功（${recovered}）`)
+    else if (recovered && stillFail) message.warning(`重试完成：成功 ${recovered}，仍失败 ${stillFail}`)
+    else message.error(`全部仍失败（${stillFail}）`)
+  } finally {
+    loading.value = false
+  }
+}
 </script>
 
 <template>
@@ -428,7 +457,19 @@ function retryOne(item: QueueItem) {
       <section v-if="hasQueue" class="panel queue-panel">
         <div class="panel-head">
           <p class="label">待解析列表</p>
-          <NButton size="tiny" quaternary :disabled="loading" @click="addEmptyRow">添加一行</NButton>
+          <div class="panel-head-actions">
+            <NButton
+              v-if="failCount > 0"
+              size="tiny"
+              type="warning"
+              secondary
+              :disabled="loading"
+              @click="retryFailed"
+            >
+              重试失败（{{ failCount }}）
+            </NButton>
+            <NButton size="tiny" quaternary :disabled="loading" @click="addEmptyRow">添加一行</NButton>
+          </div>
         </div>
         <div class="queue-table" role="table">
           <div class="queue-row queue-head" role="row">
@@ -496,6 +537,16 @@ function retryOne(item: QueueItem) {
             <span class="results-count">成功 {{ successCount }} · 失败 {{ failCount }}</span>
           </p>
           <div class="toolbar-actions">
+            <NButton
+              v-if="failCount > 0"
+              size="small"
+              type="warning"
+              secondary
+              :disabled="loading"
+              @click="retryFailed"
+            >
+              重试失败（{{ failCount }}）
+            </NButton>
             <NButton
               size="small"
               type="primary"
@@ -673,6 +724,13 @@ function retryOne(item: QueueItem) {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.panel-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   flex-wrap: wrap;
 }
 
