@@ -31,6 +31,23 @@ export function mediaDownloadUrl(proxyPath: string): string {
   return `${proxyPath}${joiner}download=1`
 }
 
+/**
+ * 触发浏览器本地下载（不新开窗口）。
+ * 同源代理 + 服务端 Content-Disposition: attachment 时由浏览器保存文件。
+ */
+export function triggerBrowserDownload(url: string, filename?: string) {
+  const a = document.createElement('a')
+  a.href = url
+  // 不写死文件名，交给服务端 Content-Disposition；有传入名时再覆盖
+  if (filename) a.download = filename
+  else a.setAttribute('download', '')
+  a.rel = 'noopener'
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}
+
 export function platformLabel(platform: string): string {
   if (platform === 'douyin') return '抖音'
   if (platform === 'xiaohongshu') return '小红书'

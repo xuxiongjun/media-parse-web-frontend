@@ -17,6 +17,7 @@ import {
   mediaDownloadUrl,
   parseShareUrl,
   platformLabel,
+  triggerBrowserDownload,
   type ApiErrorBody,
   type ParseResult
 } from '../api/parse'
@@ -35,6 +36,7 @@ const message = useMessage()
 const draft = ref('')
 const queue = ref<QueueItem[]>([])
 const loading = ref(false)
+const downloadingAll = ref(false)
 const progressDone = ref(0)
 const progressTotal = ref(0)
 const expandedNames = ref<string[]>([])
@@ -43,6 +45,19 @@ let idSeq = 0
 function nextId() {
   idSeq += 1
   return `item-${idSeq}`
+}
+
+function collectDownloadUrls(): string[] {
+  const urls: string[] = []
+  for (const item of queue.value) {
+    if (item.status !== 'done' || !item.result) continue
+    if (isImageResult(item.result)) {
+      urls.push(...(item.result.imageProxyUrls ?? []))
+    } else if (item.result.videoProxyUrl) {
+      urls.push(item.result.videoProxyUrl)
+    }
+  }
+  return urls
 }
 
 const hasDraft = computed(() => draft.value.trim().length > 0)
@@ -54,6 +69,7 @@ const progressPercent = computed(() => {
 const successCount = computed(() => queue.value.filter((i) => i.status === 'done').length)
 const failCount = computed(() => queue.value.filter((i) => i.status === 'error').length)
 const doneItems = computed(() => queue.value.filter((i) => i.status === 'done' || i.status === 'error'))
+const downloadableCount = computed(() => collectDownloadUrls().length)
 
 watch(
   doneItems,
@@ -231,13 +247,18 @@ function collapseAll() {
   expandedNames.value = []
 }
 
+function downloadProxy(proxyUrl: string, filename?: string) {
+  triggerBrowserDownload(mediaDownloadUrl(proxyUrl), filename)
+}
+
 function onDownloadVideo(result: ParseResult) {
   if (!result.videoProxyUrl) return
-  window.open(mediaDownloadUrl(result.videoProxyUrl), '_blank')
+  downloadProxy(result.videoProxyUrl)
+  message.success('已开始下载视频')
 }
 
 function onDownloadImage(proxyUrl: string) {
-  window.open(mediaDownloadUrl(proxyUrl), '_blank')
+  downloadProxy(proxyUrl)
 }
 
 async function copyText(text: string, okTip: string) {
@@ -263,13 +284,34 @@ function onCopyImageLink(proxyUrl: string) {
   copyText(absolute, '图片链接已复制')
 }
 
-function onDownloadAllImages(result: ParseResult) {
+async function downloadUrlsSequentially(urls: string[], gapMs = 450) {
+  for (let i = 0; i < urls.length; i++) {
+    downloadProxy(urls[i])
+    if (i < urls.length - 1) await sleep(gapMs)
+  }
+}
+
+async function onDownloadAllImages(result: ParseResult) {
   const images = result.imageProxyUrls ?? []
   if (!images.length) return
-  images.forEach((url, index) => {
-    window.setTimeout(() => onDownloadImage(url), index * 350)
-  })
-  message.success(`开始下载 ${images.length} 张图片`)
+  await downloadUrlsSequentially(images)
+  message.success(`已触发 ${images.length} 张图片下载`)
+}
+
+async function onDownloadAll() {
+  const urls = collectDownloadUrls()
+  if (!urls.length) {
+    message.warning('没有可下载的内容')
+    return
+  }
+  if (downloadingAll.value) return
+  downloadingAll.value = true
+  try {
+    await downloadUrlsSequentially(urls)
+    message.success(`已触发全部下载（${urls.length} 个文件）`)
+  } finally {
+    downloadingAll.value = false
+  }
 }
 
 function retryOne(item: QueueItem) {
@@ -405,6 +447,15 @@ function retryOne(item: QueueItem) {
             <span class="results-count">成功 {{ successCount }} · 失败 {{ failCount }}</span>
           </p>
           <div class="toolbar-actions">
+            <NButton
+              size="small"
+              type="primary"
+              :loading="downloadingAll"
+              :disabled="!downloadableCount || downloadingAll || loading"
+              @click="onDownloadAll"
+            >
+              下载全部{{ downloadableCount ? `（${downloadableCount}）` : '' }}
+            </NButton>
             <NButton size="small" quaternary @click="expandAll">全部展开</NButton>
             <NButton size="small" quaternary @click="collapseAll">全部折叠</NButton>
           </div>
