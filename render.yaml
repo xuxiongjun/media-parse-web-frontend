@@ -8,5 +8,6 @@ services:
     staticPublishPath: dist
     envVars:
       - key: VITE_API_BASE
-        # 在 Dashboard 里改成你的后端地址，例如 https://media-parse-web-server-xxxx.onrender.com
+        # 必须改成真实后端地址（不要用 xxxx 占位），例如：
+        # https://media-parse-web-server.onrender.com
         sync: false
