@@ -72,29 +72,32 @@ function splitName(filename: string): { stem: string; ext: string } {
   return { stem: filename.slice(0, i), ext: filename.slice(i) }
 }
 
-async function ensureUniqueFilename(
-  dir: FileSystemDirectoryHandle,
-  preferred: string
-): Promise<string> {
+/** 用内存集合去重，避免对目录反复 getFileHandle 探测导致卡顿 */
+function nextUniqueFilename(used: Set<string>, preferred: string): string {
   const base = sanitizeFilename(preferred)
   const { stem, ext } = splitName(base)
   let candidate = base
   let n = 1
-  while (true) {
-    try {
-      await dir.getFileHandle(candidate)
-      candidate = `${stem} (${n})${ext}`
-      n += 1
-    } catch {
-      return candidate
-    }
+  while (used.has(candidate.toLowerCase())) {
+    candidate = `${stem} (${n})${ext}`
+    n += 1
   }
+  used.add(candidate.toLowerCase())
+  return candidate
+}
+
+/** 让出主线程，保证进度条与点击可响应 */
+function yieldToUi(): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, 0)
+  })
 }
 
 async function writeUrlToDirectory(
   dir: FileSystemDirectoryHandle,
   url: string,
-  index: number
+  index: number,
+  usedNames: Set<string>
 ): Promise<string> {
   const response = await fetch(url)
   if (!response.ok) {
@@ -103,7 +106,7 @@ async function writeUrlToDirectory(
 
   const fromHeader = parseFilenameFromDisposition(response.headers.get('Content-Disposition'))
   const preferred = fromHeader || fallbackFilename(index, response.headers.get('Content-Type'))
-  const filename = await ensureUniqueFilename(dir, preferred)
+  const filename = nextUniqueFilename(usedNames, preferred)
   const fileHandle = await dir.getFileHandle(filename, { create: true })
   const writable = await fileHandle.createWritable()
 
@@ -154,17 +157,20 @@ export async function saveUrlsToPickedFolder(
   let ok = 0
   let fail = 0
   const total = urls.length
+  const usedNames = new Set<string>()
 
   for (let i = 0; i < urls.length; i++) {
     options?.onProgress?.({ done: i, total, currentName: `第 ${i + 1} 个文件` })
     try {
-      const name = await writeUrlToDirectory(dir, urls[i], i)
+      const name = await writeUrlToDirectory(dir, urls[i], i, usedNames)
       ok += 1
       options?.onProgress?.({ done: i + 1, total, currentName: name })
     } catch {
       fail += 1
       options?.onProgress?.({ done: i + 1, total })
     }
+    // 每写完一个文件让出主线程，避免大批量时页面假死
+    await yieldToUi()
   }
 
   return { mode: 'folder', ok, fail }

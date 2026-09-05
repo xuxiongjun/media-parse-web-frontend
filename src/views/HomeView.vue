@@ -47,6 +47,8 @@ const showBackTop = ref(false)
 
 /** 单次批量上限，避免过长列表拖垮页面与接口 */
 const MAX_QUEUE = 99
+/** 超过该数量不再自动展开结果，避免同时挂载大量媒体导致卡死 */
+const AUTO_EXPAND_LIMIT = 8
 
 let idSeq = 0
 function nextId() {
@@ -109,13 +111,13 @@ onUnmounted(() => {
   if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
 })
 
-/** 仅自动展开新完成的条目，保留用户手动折叠状态 */
+/** 仅自动展开新完成的条目（小批量）；保留用户手动折叠状态 */
 watch(
   () => doneItems.value.map((i) => i.id),
   (ids, prevIds = []) => {
     const prev = new Set(prevIds)
     const newlyDone = ids.filter((id) => !prev.has(id))
-    if (newlyDone.length) {
+    if (newlyDone.length && ids.length <= AUTO_EXPAND_LIMIT) {
       const open = new Set(expandedNames.value)
       for (const id of newlyDone) open.add(id)
       expandedNames.value = [...open]
@@ -178,6 +180,7 @@ async function locateResult(item: QueueItem) {
   if (!expandedNames.value.includes(item.id)) {
     expandedNames.value = [...expandedNames.value, item.id]
   }
+  await nextTick()
   await nextTick()
   const anchor = document.getElementById(`result-${item.id}`)
   const el = (anchor?.closest('.n-collapse-item') as HTMLElement | null) ?? anchor
@@ -344,7 +347,15 @@ function onKeydown(e: KeyboardEvent) {
 }
 
 function expandAll() {
-  expandedNames.value = doneItems.value.map((i) => i.id)
+  const items = doneItems.value
+  if (items.length > AUTO_EXPAND_LIMIT) {
+    expandedNames.value = items.slice(0, AUTO_EXPAND_LIMIT).map((i) => i.id)
+    message.warning(
+      `结果较多，全部展开易卡顿，已展开前 ${AUTO_EXPAND_LIMIT} 条（共 ${items.length}）`
+    )
+    return
+  }
+  expandedNames.value = items.map((i) => i.id)
 }
 
 function collapseAll() {
@@ -403,6 +414,8 @@ function copyFailedTexts() {
 async function downloadUrlsSequentially(urls: string[], gapMs = 450) {
   for (let i = 0; i < urls.length; i++) {
     downloadProxy(urls[i])
+    downloadSaveDone.value = i + 1
+    downloadSaveTotal.value = urls.length
     if (i < urls.length - 1) await sleep(gapMs)
   }
 }
@@ -529,7 +542,7 @@ async function retryFailed() {
         <p class="brand">清影解析</p>
         <h1 class="headline">粘贴分享链接，批量获取可预览与下载的视频 / 图集</h1>
         <p class="sub">
-          支持抖音、小红书。一次可粘贴多条分享文案，整理后批量解析；结果默认全部展开，便于对照下载。
+          支持抖音、小红书。一次最多 {{ MAX_QUEUE }} 条；结果较多时默认折叠，可按需展开或下载全部。
         </p>
       </header>
 
@@ -712,7 +725,7 @@ async function retryFailed() {
           </div>
         </div>
 
-        <NCollapse v-model:expanded-names="expandedNames" display-directive="show">
+        <NCollapse v-model:expanded-names="expandedNames" display-directive="if">
           <NCollapseItem
             v-for="(item, index) in doneItems"
             :key="item.id"
