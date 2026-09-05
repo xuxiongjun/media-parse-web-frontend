@@ -40,6 +40,8 @@ const loading = ref(false)
 const downloadingAll = ref(false)
 const downloadSaveDone = ref(0)
 const downloadSaveTotal = ref(0)
+const downloadSaveLabel = ref('')
+const downloadSaveFailHint = ref('')
 const progressDone = ref(0)
 const progressTotal = ref(0)
 const expandedNames = ref<string[]>([])
@@ -56,17 +58,32 @@ function nextId() {
   return `item-${idSeq}`
 }
 
-function collectDownloadUrls(): string[] {
-  const urls: string[] = []
-  for (const item of queue.value) {
-    if (item.status !== 'done' || !item.result) continue
+function collectDownloadJobs(): Array<{ url: string; label: string }> {
+  const jobs: Array<{ url: string; label: string }> = []
+  queue.value.forEach((item, index) => {
+    if (item.status !== 'done' || !item.result) return
+    const num = index + 1
+    const title = item.result.title?.trim() || shortUrl(item.raw)
     if (isImageResult(item.result)) {
-      urls.push(...(item.result.imageProxyUrls ?? []))
+      const images = item.result.imageProxyUrls ?? []
+      images.forEach((url, imgIndex) => {
+        jobs.push({
+          url,
+          label: `#${num} · 图${imgIndex + 1}/${images.length} · ${title}`
+        })
+      })
     } else if (item.result.videoProxyUrl) {
-      urls.push(item.result.videoProxyUrl)
+      jobs.push({
+        url: item.result.videoProxyUrl,
+        label: `#${num} · 视频 · ${title}`
+      })
     }
-  }
-  return urls
+  })
+  return jobs
+}
+
+function collectDownloadUrls(): string[] {
+  return collectDownloadJobs().map((j) => j.url)
 }
 
 const hasDraft = computed(() => draft.value.trim().length > 0)
@@ -421,18 +438,33 @@ async function downloadUrlsSequentially(urls: string[], gapMs = 450) {
 }
 
 /** 优先选文件夹写入；不支持时降级为逐个触发浏览器下载 */
-async function saveUrlsPreferFolder(proxyUrls: string[]): Promise<void> {
-  const urls = proxyUrls.map((u) => mediaDownloadUrl(u))
+async function saveUrlsPreferFolder(
+  jobs: Array<{ url: string; label?: string }> | string[]
+): Promise<void> {
+  const items = jobs.map((j) => (typeof j === 'string' ? { url: j } : j))
+  const proxyUrls = items.map((j) => j.url)
   downloadSaveDone.value = 0
-  downloadSaveTotal.value = urls.length
+  downloadSaveTotal.value = items.length
+  downloadSaveLabel.value = ''
+  downloadSaveFailHint.value = ''
 
   if (canUseDirectoryPicker()) {
-    const outcome = await saveUrlsToPickedFolder(urls, {
-      onProgress: (p) => {
-        downloadSaveDone.value = p.done
-        downloadSaveTotal.value = p.total
+    const outcome = await saveUrlsToPickedFolder(
+      items.map((j) => ({
+        url: mediaDownloadUrl(j.url),
+        label: j.label
+      })),
+      {
+        onProgress: (p) => {
+          downloadSaveDone.value = p.done
+          downloadSaveTotal.value = p.total
+          downloadSaveLabel.value = p.currentLabel || p.currentName || ''
+          if (p.phase === 'fail' && p.failReason) {
+            downloadSaveFailHint.value = `已跳过：${p.currentLabel || ''}（${p.failReason}）`
+          }
+        }
       }
-    })
+    )
     if (outcome.mode === 'folder' && outcome.cancelled) {
       message.info('已取消选择文件夹')
       return
@@ -441,9 +473,15 @@ async function saveUrlsPreferFolder(proxyUrls: string[]): Promise<void> {
       if (outcome.fail === 0) {
         message.success(`已保存 ${outcome.ok} 个文件到所选文件夹`)
       } else if (outcome.ok === 0) {
-        message.error(`保存失败（${outcome.fail} 个）`)
+        message.error(`全部保存失败（${outcome.fail} 个）`)
       } else {
-        message.warning(`已保存 ${outcome.ok} 个，失败 ${outcome.fail} 个`)
+        const sample = outcome.failed
+          .slice(0, 3)
+          .map((f) => f.label)
+          .join('；')
+        message.warning(
+          `已保存 ${outcome.ok} 个，跳过 ${outcome.fail} 个${sample ? `（如 ${sample}）` : ''}`
+        )
       }
       return
     }
@@ -460,32 +498,41 @@ async function onDownloadAllImages(result: ParseResult) {
   if (downloadingAll.value) return
   downloadingAll.value = true
   try {
-    await saveUrlsPreferFolder(images)
+    await saveUrlsPreferFolder(
+      images.map((url, i) => ({
+        url,
+        label: `图${i + 1}/${images.length} · ${result.title?.trim() || '未命名图文'}`
+      }))
+    )
   } catch (err) {
     message.error(err instanceof Error ? err.message : '批量保存失败')
   } finally {
     downloadingAll.value = false
     downloadSaveDone.value = 0
     downloadSaveTotal.value = 0
+    downloadSaveLabel.value = ''
+    downloadSaveFailHint.value = ''
   }
 }
 
 async function onDownloadAll() {
-  const urls = collectDownloadUrls()
-  if (!urls.length) {
+  const jobs = collectDownloadJobs()
+  if (!jobs.length) {
     message.warning('没有可下载的内容')
     return
   }
   if (downloadingAll.value) return
   downloadingAll.value = true
   try {
-    await saveUrlsPreferFolder(urls)
+    await saveUrlsPreferFolder(jobs)
   } catch (err) {
     message.error(err instanceof Error ? err.message : '批量保存失败')
   } finally {
     downloadingAll.value = false
     downloadSaveDone.value = 0
     downloadSaveTotal.value = 0
+    downloadSaveLabel.value = ''
+    downloadSaveFailHint.value = ''
   }
 }
 
@@ -724,6 +771,12 @@ async function retryFailed() {
             <NButton size="small" quaternary @click="collapseAll">全部折叠</NButton>
           </div>
         </div>
+        <p v-if="downloadingAll && downloadSaveLabel" class="download-current">
+          当前：{{ downloadSaveLabel }}
+        </p>
+        <p v-if="downloadingAll && downloadSaveFailHint" class="download-skip">
+          {{ downloadSaveFailHint }}
+        </p>
 
         <NCollapse v-model:expanded-names="expandedNames" display-directive="if">
           <NCollapseItem
@@ -1021,6 +1074,22 @@ async function retryFailed() {
   color: var(--muted);
   font-size: 0.85rem;
   font-weight: 400;
+}
+
+.download-current,
+.download-skip {
+  margin: -4px 4px 0;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  word-break: break-all;
+}
+
+.download-current {
+  color: var(--muted);
+}
+
+.download-skip {
+  color: var(--danger);
 }
 
 .toolbar-actions {
