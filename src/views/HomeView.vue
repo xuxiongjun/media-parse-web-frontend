@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import { NButton, NInput, NSpin, NTag, useMessage } from 'naive-ui'
 import axios from 'axios'
 import {
+  isImageResult,
   mediaDownloadUrl,
   parseShareUrl,
   platformLabel,
@@ -17,6 +18,8 @@ const result = ref<ParseResult | null>(null)
 
 const hasInput = computed(() => input.value.trim().length > 0)
 const canSubmit = computed(() => hasInput.value && !loading.value)
+const imageMode = computed(() => isImageResult(result.value))
+const images = computed(() => result.value?.imageProxyUrls ?? [])
 
 async function onParse(text?: string) {
   const url = (text ?? input.value).trim()
@@ -62,9 +65,44 @@ async function onPasteAndSearch() {
   }
 }
 
-function onDownload() {
+function onDownloadVideo() {
   if (!result.value?.videoProxyUrl) return
   window.open(mediaDownloadUrl(result.value.videoProxyUrl), '_blank')
+}
+
+function onDownloadImage(proxyUrl: string) {
+  window.open(mediaDownloadUrl(proxyUrl), '_blank')
+}
+
+async function copyText(text: string, okTip: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success(okTip)
+  } catch {
+    message.error('复制失败，请手动选择复制')
+  }
+}
+
+function onCopyTitle() {
+  const title = result.value?.title?.trim()
+  if (!title) {
+    message.warning('没有可复制的标题')
+    return
+  }
+  copyText(title, '标题已复制')
+}
+
+function onCopyImageLink(proxyUrl: string) {
+  const absolute = new URL(proxyUrl, window.location.origin).href
+  copyText(absolute, '图片链接已复制')
+}
+
+function onDownloadAllImages() {
+  if (!images.value.length) return
+  images.value.forEach((url, index) => {
+    window.setTimeout(() => onDownloadImage(url), index * 350)
+  })
+  message.success(`开始下载 ${images.value.length} 张图片`)
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -79,7 +117,7 @@ function onKeydown(e: KeyboardEvent) {
     <main class="shell">
       <header class="hero">
         <p class="brand">清影解析</p>
-        <h1 class="headline">粘贴分享链接，获取可预览与下载的视频</h1>
+        <h1 class="headline">粘贴分享链接，获取可预览与下载的视频 / 图集</h1>
         <p class="sub">支持抖音、小红书。解析结果经服务端代理，不直接暴露真实资源地址。</p>
       </header>
 
@@ -126,6 +164,34 @@ function onKeydown(e: KeyboardEvent) {
         <p>正在解析，请稍候…</p>
       </section>
 
+      <section v-else-if="result && imageMode" class="result result-images">
+        <div class="result-meta">
+          <div class="meta-top">
+            <NTag size="small" round :bordered="false" type="success">
+              {{ platformLabel(result.platform) }} · 图文
+            </NTag>
+            <span class="duration">共 {{ images.length }} 张</span>
+          </div>
+          <h2 class="title">{{ result.title || '未命名图文' }}</h2>
+          <p v-if="result.author" class="author">作者：{{ result.author }}</p>
+          <div class="batch-actions">
+            <NButton strong secondary @click="onCopyTitle">复制标题文案</NButton>
+            <NButton type="primary" @click="onDownloadAllImages">保存所有图片</NButton>
+          </div>
+        </div>
+
+        <div class="image-grid">
+          <article v-for="(img, index) in images" :key="img" class="image-card">
+            <img :src="img" :alt="`图片 ${index + 1}`" loading="lazy" />
+            <div class="image-actions">
+              <button type="button" class="link-btn" @click="onCopyImageLink(img)">复制链接</button>
+              <button type="button" class="link-btn" @click="onDownloadImage(img)">下载图片</button>
+            </div>
+          </article>
+        </div>
+        <p class="hint">代理链接短时有效，过期请重新解析。</p>
+      </section>
+
       <section v-else-if="result" class="result">
         <div class="result-media">
           <video
@@ -145,7 +211,7 @@ function onKeydown(e: KeyboardEvent) {
           </div>
           <h2 class="title">{{ result.title || '未命名视频' }}</h2>
           <p v-if="result.author" class="author">作者：{{ result.author }}</p>
-          <NButton type="primary" size="large" block @click="onDownload">
+          <NButton type="primary" size="large" block @click="onDownloadVideo">
             下载无水印视频
           </NButton>
           <p class="hint">代理链接短时有效，过期请重新解析。</p>
@@ -248,6 +314,10 @@ function onKeydown(e: KeyboardEvent) {
   box-shadow: var(--shadow);
 }
 
+.result-images {
+  grid-template-columns: 1fr;
+}
+
 .result-media {
   min-width: 0;
 }
@@ -293,6 +363,56 @@ function onKeydown(e: KeyboardEvent) {
   font-size: 0.92rem;
 }
 
+.batch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.batch-actions :deep(.n-button) {
+  flex: 1;
+  min-width: 140px;
+}
+
+.image-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.image-card {
+  min-width: 0;
+}
+
+.image-card img {
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  object-fit: cover;
+  border-radius: 12px;
+  background: #0a1210;
+  display: block;
+}
+
+.image-actions {
+  margin-top: 8px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.link-btn {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 4px 0;
+  font-size: 0.9rem;
+}
+
+.link-btn:hover {
+  color: #45e0b6;
+}
+
 .hint {
   margin: 0;
   color: var(--muted);
@@ -325,6 +445,11 @@ function onKeydown(e: KeyboardEvent) {
 
   .actions :deep(.n-button) {
     flex: 1;
+  }
+
+  .image-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
   }
 }
 </style>

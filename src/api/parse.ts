@@ -2,10 +2,12 @@ import axios from 'axios'
 
 export interface ParseResult {
   platform: string
+  mediaType?: 'video' | 'image' | string
   title: string
   author?: string
   coverProxyUrl?: string
-  videoProxyUrl: string
+  videoProxyUrl?: string
+  imageProxyUrls?: string[]
   duration?: number
   expireAt?: number
 }
@@ -33,4 +35,10 @@ export function platformLabel(platform: string): string {
   if (platform === 'douyin') return '抖音'
   if (platform === 'xiaohongshu') return '小红书'
   return platform
+}
+
+export function isImageResult(result: ParseResult | null | undefined): boolean {
+  if (!result) return false
+  if (result.mediaType === 'image') return true
+  return Array.isArray(result.imageProxyUrls) && result.imageProxyUrls.length > 0 && !result.videoProxyUrl
 }
