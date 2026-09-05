@@ -21,7 +21,12 @@ import {
   type ApiErrorBody,
   type ParseResult
 } from '../api/parse'
-import { canUseDirectoryPicker, saveUrlsToPickedFolder } from '../api/folderDownload'
+import {
+  canUseDirectoryPicker,
+  isExpiredDownloadReason,
+  pickDownloadFolder,
+  writeOneUrlToDirectory
+} from '../api/folderDownload'
 
 type ItemStatus = 'idle' | 'parsing' | 'done' | 'error'
 
@@ -40,13 +45,22 @@ interface DownloadFailItem {
   reason: string
   /** 对应队列中的分享文案 / 链接，便于复制 */
   raw?: string
+  itemId?: string
+  kind?: 'video' | 'image'
+  imageIndex?: number
 }
 
 interface DownloadJob {
   url: string
   label: string
   raw?: string
+  itemId?: string
+  kind?: 'video' | 'image'
+  imageIndex?: number
 }
+
+/** 代理 token 剩余不足此时长则先重新解析，避免大批量下载中途 404 */
+const TOKEN_REFRESH_MARGIN_MS = 120_000
 
 const message = useMessage()
 const draft = ref('')
@@ -74,31 +88,61 @@ function nextId() {
   return `item-${idSeq}`
 }
 
+function jobsFromQueueItem(item: QueueItem, index: number): DownloadJob[] {
+  if (item.status !== 'done' || !item.result) return []
+  const jobs: DownloadJob[] = []
+  const num = index + 1
+  const title = item.result.title?.trim() || shortUrl(item.raw)
+  const raw = item.raw.trim()
+  if (isImageResult(item.result)) {
+    const images = item.result.imageProxyUrls ?? []
+    images.forEach((url, imgIndex) => {
+      jobs.push({
+        url,
+        label: `#${num} · 图${imgIndex + 1}/${images.length} · ${title}`,
+        raw,
+        itemId: item.id,
+        kind: 'image',
+        imageIndex: imgIndex
+      })
+    })
+  } else if (item.result.videoProxyUrl) {
+    jobs.push({
+      url: item.result.videoProxyUrl,
+      label: `#${num} · 视频 · ${title}`,
+      raw,
+      itemId: item.id,
+      kind: 'video'
+    })
+  }
+  return jobs
+}
+
 function collectDownloadJobs(): DownloadJob[] {
   const jobs: DownloadJob[] = []
   queue.value.forEach((item, index) => {
-    if (item.status !== 'done' || !item.result) return
-    const num = index + 1
-    const title = item.result.title?.trim() || shortUrl(item.raw)
-    const raw = item.raw.trim()
-    if (isImageResult(item.result)) {
-      const images = item.result.imageProxyUrls ?? []
-      images.forEach((url, imgIndex) => {
-        jobs.push({
-          url,
-          label: `#${num} · 图${imgIndex + 1}/${images.length} · ${title}`,
-          raw
-        })
-      })
-    } else if (item.result.videoProxyUrl) {
-      jobs.push({
-        url: item.result.videoProxyUrl,
-        label: `#${num} · 视频 · ${title}`,
-        raw
-      })
-    }
+    jobs.push(...jobsFromQueueItem(item, index))
   })
   return jobs
+}
+
+function isTokenStale(result: ParseResult | null | undefined): boolean {
+  if (!result?.expireAt) return false
+  return result.expireAt - Date.now() < TOKEN_REFRESH_MARGIN_MS
+}
+
+function resolveJobAfterRefresh(item: QueueItem, job: DownloadJob): DownloadJob | null {
+  const index = queue.value.findIndex((q) => q.id === item.id)
+  const freshJobs = jobsFromQueueItem(item, index >= 0 ? index : 0)
+  if (job.kind === 'video') {
+    return freshJobs.find((j) => j.kind === 'video') || null
+  }
+  if (job.kind === 'image' && job.imageIndex != null) {
+    return (
+      freshJobs.find((j) => j.kind === 'image' && j.imageIndex === job.imageIndex) || null
+    )
+  }
+  return freshJobs[0] || null
 }
 
 function collectDownloadUrls(): string[] {
@@ -476,76 +520,237 @@ async function downloadUrlsSequentially(urls: string[], gapMs = 450) {
 
 /** 本轮尝试后同步失败重试列表：成功的移出，仍失败的写入/更新 */
 function syncDownloadFailsAfterSave(attempted: DownloadJob[], failed: DownloadFailItem[]) {
-  const attemptedSet = new Set(attempted.map((a) => a.url))
-  const kept = downloadFailList.value.filter((i) => !attemptedSet.has(i.url))
+  const attemptedKeys = new Set(
+    attempted.map((a) => failKey(a))
+  )
+  const kept = downloadFailList.value.filter((i) => !attemptedKeys.has(failKey(i)))
   downloadFailList.value = [...kept, ...failed]
+}
+
+function failKey(item: { url: string; itemId?: string; kind?: string; imageIndex?: number }) {
+  if (item.itemId && item.kind === 'image' && item.imageIndex != null) {
+    return `${item.itemId}:img:${item.imageIndex}`
+  }
+  if (item.itemId && item.kind === 'video') {
+    return `${item.itemId}:video`
+  }
+  return item.url
 }
 
 function clearDownloadFails() {
   downloadFailList.value = []
 }
 
-function removeDownloadFail(url: string) {
-  downloadFailList.value = downloadFailList.value.filter((i) => i.url !== url)
+function removeDownloadFail(item: DownloadFailItem) {
+  const key = failKey(item)
+  downloadFailList.value = downloadFailList.value.filter((i) => failKey(i) !== key)
 }
 
-/** 优先选文件夹写入；不支持时降级为逐个触发浏览器下载 */
-async function saveUrlsPreferFolder(jobs: DownloadJob[] | string[]): Promise<void> {
-  const items: DownloadJob[] = jobs.map((j) => (typeof j === 'string' ? { url: j, label: '' } : j))
-  const proxyUrls = items.map((j) => j.url)
+function toFailItem(job: DownloadJob, reason: string): DownloadFailItem {
+  return {
+    url: job.url,
+    label: job.label,
+    reason,
+    raw: job.raw,
+    itemId: job.itemId,
+    kind: job.kind,
+    imageIndex: job.imageIndex
+  }
+}
+
+/** 下载前确保代理链接未临近过期；过期则重新解析 */
+async function ensureFreshForDownload(item: QueueItem, force = false): Promise<boolean> {
+  if (!force && !isTokenStale(item.result)) return item.status === 'done' && !!item.result
+  downloadSaveLabel.value = `链接即将过期，重新解析：${shortUrl(item.raw)}`
+  downloadSaveFailHint.value = ''
+  await parseOne(item)
+  // 批量刷新时拉开间隔，降低触发解析限流概率
+  await sleep(BATCH_GAP_MS)
+  return item.status === 'done' && !!item.result
+}
+
+function findQueueItemForJob(job: DownloadJob): QueueItem | undefined {
+  if (job.itemId) return queue.value.find((i) => i.id === job.itemId)
+  const raw = job.raw?.trim()
+  if (raw) return queue.value.find((i) => i.raw.trim() === raw)
+  return undefined
+}
+
+/**
+ * 按队列条目边刷新边下载：选文件夹一次，每条临近过期先重解析；
+ * 遇到 404/过期再自动重解析并重试该文件一次。
+ */
+async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
+  if (!jobs.length) return
+
   downloadSaveDone.value = 0
-  downloadSaveTotal.value = items.length
+  downloadSaveTotal.value = jobs.length
   downloadSaveLabel.value = ''
   downloadSaveFailHint.value = ''
 
-  if (canUseDirectoryPicker()) {
-    const downloadItems = items.map((j) => ({
-      url: mediaDownloadUrl(j.url),
-      label: j.label
-    }))
-    const dlToOrig = new Map(downloadItems.map((d, i) => [d.url, items[i]] as const))
-    const outcome = await saveUrlsToPickedFolder(downloadItems, {
-      onProgress: (p) => {
-        downloadSaveDone.value = p.done
-        downloadSaveTotal.value = p.total
-        downloadSaveLabel.value = p.currentLabel || p.currentName || ''
-        if (p.phase === 'fail' && p.failReason) {
-          downloadSaveFailHint.value = `已跳过：${p.currentLabel || ''}（${p.failReason}）`
+  if (!canUseDirectoryPicker()) {
+    // 降级：先按条目刷新，再触发浏览器下载
+    const freshUrls: string[] = []
+    const failed: DownloadFailItem[] = []
+    const groups = groupJobsByItem(jobs)
+    for (const group of groups) {
+      const item = group.item
+      if (item) {
+        const ok = await ensureFreshForDownload(item)
+        if (!ok) {
+          for (const job of group.jobs) {
+            failed.push(toFailItem(job, item.error || '重新解析失败'))
+          }
+          continue
         }
+        for (const job of group.jobs) {
+          const mapped = resolveJobAfterRefresh(item, job) || job
+          freshUrls.push(mapped.url)
+        }
+      } else {
+        for (const job of group.jobs) freshUrls.push(job.url)
       }
-    })
-    if (outcome.mode === 'folder' && outcome.cancelled) {
+    }
+    syncDownloadFailsAfterSave(jobs, failed)
+    if (!freshUrls.length) {
+      message.error(`全部需重新解析后仍失败，已加入失败重试列表（${failed.length}）`)
+      return
+    }
+    message.info('当前浏览器不支持选文件夹，将逐个触发下载（可能需允许「多个下载」）')
+    await downloadUrlsSequentially(freshUrls)
+    if (failed.length) {
+      message.warning(`已触发下载 ${freshUrls.length} 个，${failed.length} 个已加入失败重试列表`)
+    } else {
+      message.success(`已触发下载（${freshUrls.length} 个文件）`)
+    }
+    return
+  }
+
+  const picked = await pickDownloadFolder()
+  if (!picked.ok) {
+    if ('cancelled' in picked && picked.cancelled) {
       message.info('已取消选择文件夹')
       return
     }
-    if (outcome.mode === 'folder') {
-      const failedJobs: DownloadFailItem[] = outcome.failed.map((f) => {
-        const orig = dlToOrig.get(f.url)
-        return {
-          url: orig?.url ?? f.url,
-          label: f.label || orig?.label || '',
-          reason: f.reason,
-          raw: orig?.raw
-        }
-      })
-      syncDownloadFailsAfterSave(items, failedJobs)
+    message.info('当前浏览器不支持选文件夹，将逐个触发下载（可能需允许「多个下载」）')
+    await downloadUrlsSequentially(jobs.map((j) => j.url))
+    message.success(`已触发下载（${jobs.length} 个文件）`)
+    return
+  }
 
-      if (outcome.fail === 0) {
-        message.success(`已保存 ${outcome.ok} 个文件到所选文件夹`)
-      } else if (outcome.ok === 0) {
-        message.error(`全部保存失败，已加入失败重试列表（${outcome.fail}）`)
-      } else {
-        message.warning(
-          `已保存 ${outcome.ok} 个，${outcome.fail} 个已加入失败重试列表`
-        )
+  const dir = picked.dir
+  const usedNames = new Set<string>()
+  const failed: DownloadFailItem[] = []
+  let ok = 0
+  let fileIndex = 0
+  const groups = groupJobsByItem(jobs)
+
+  for (const group of groups) {
+    const item = group.item
+    let refreshedThisItem = false
+
+    if (item) {
+      const needRefresh = isTokenStale(item.result)
+      if (needRefresh) {
+        downloadSaveLabel.value = `重新解析后下载：${shortUrl(item.raw)}`
+        const fresh = await ensureFreshForDownload(item, true)
+        refreshedThisItem = true
+        if (!fresh) {
+          for (const job of group.jobs) {
+            failed.push(toFailItem(job, item.error || '重新解析失败'))
+            fileIndex += 1
+            downloadSaveDone.value = Math.min(fileIndex, downloadSaveTotal.value)
+          }
+          continue
+        }
       }
-      return
+    }
+
+    for (const originalJob of group.jobs) {
+      let job =
+        item && refreshedThisItem
+          ? resolveJobAfterRefresh(item, originalJob) || originalJob
+          : originalJob
+
+      downloadSaveLabel.value = job.label
+      downloadSaveFailHint.value = ''
+      fileIndex += 1
+      downloadSaveDone.value = Math.min(fileIndex - 1, downloadSaveTotal.value)
+
+      let result = await writeOneUrlToDirectory(
+        dir,
+        { url: mediaDownloadUrl(job.url), label: job.label },
+        { index: fileIndex - 1, usedNames }
+      )
+
+      if (
+        !result.ok &&
+        item &&
+        isExpiredDownloadReason(result.reason) &&
+        !refreshedThisItem
+      ) {
+        downloadSaveFailHint.value = `链接过期，正在重新解析：${shortUrl(item.raw)}`
+        const fresh = await ensureFreshForDownload(item, true)
+        refreshedThisItem = true
+        if (fresh) {
+          const mapped = resolveJobAfterRefresh(item, originalJob)
+          if (mapped) {
+            job = mapped
+            downloadSaveLabel.value = job.label
+            result = await writeOneUrlToDirectory(
+              dir,
+              { url: mediaDownloadUrl(job.url), label: job.label },
+              { index: fileIndex - 1, usedNames }
+            )
+          }
+        }
+      }
+
+      downloadSaveDone.value = Math.min(fileIndex, downloadSaveTotal.value)
+
+      if (result.ok) {
+        ok += 1
+      } else {
+        downloadSaveFailHint.value = `已跳过：${job.label}（${result.reason}）`
+        failed.push(toFailItem(job, result.reason))
+      }
     }
   }
 
-  message.info('当前浏览器不支持选文件夹，将逐个触发下载（可能需允许「多个下载」）')
-  await downloadUrlsSequentially(proxyUrls)
-  message.success(`已触发下载（${proxyUrls.length} 个文件）`)
+  syncDownloadFailsAfterSave(jobs, failed)
+
+  if (failed.length === 0) {
+    message.success(`已保存 ${ok} 个文件到所选文件夹`)
+  } else if (ok === 0) {
+    message.error(`全部保存失败，已加入失败重试列表（${failed.length}）`)
+  } else {
+    message.warning(`已保存 ${ok} 个，${failed.length} 个已加入失败重试列表`)
+  }
+}
+
+function groupJobsByItem(jobs: DownloadJob[]): Array<{ item?: QueueItem; jobs: DownloadJob[] }> {
+  const order: string[] = []
+  const map = new Map<string, DownloadJob[]>()
+  for (const job of jobs) {
+    const key = job.itemId || job.raw || job.url
+    if (!map.has(key)) {
+      map.set(key, [])
+      order.push(key)
+    }
+    map.get(key)!.push(job)
+  }
+  return order.map((key) => {
+    const groupJobs = map.get(key)!
+    return { item: findQueueItemForJob(groupJobs[0]), jobs: groupJobs }
+  })
+}
+
+/** 简单批量（单条图集等）：不强制按过期刷新，但仍处理 404 重解析 */
+async function saveUrlsPreferFolder(jobs: DownloadJob[] | string[]): Promise<void> {
+  const items: DownloadJob[] = jobs.map((j) =>
+    typeof j === 'string' ? { url: j, label: '' } : j
+  )
+  await saveJobsWithLiveRefresh(items)
 }
 
 async function onDownloadAllImages(result: ParseResult) {
@@ -553,14 +758,35 @@ async function onDownloadAllImages(result: ParseResult) {
   if (!images.length) return
   if (downloadingAll.value) return
   const owner = queue.value.find((i) => i.result === result)
-  const raw = owner?.raw.trim() || undefined
+  if (owner) {
+    downloadingAll.value = true
+    try {
+      await ensureFreshForDownload(owner)
+      if (owner.status !== 'done' || !owner.result) {
+        message.error(owner.error || '重新解析失败，无法下载')
+        return
+      }
+      const index = queue.value.findIndex((i) => i.id === owner.id)
+      await saveJobsWithLiveRefresh(jobsFromQueueItem(owner, index >= 0 ? index : 0))
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '批量保存失败')
+    } finally {
+      downloadingAll.value = false
+      downloadSaveDone.value = 0
+      downloadSaveTotal.value = 0
+      downloadSaveLabel.value = ''
+      downloadSaveFailHint.value = ''
+    }
+    return
+  }
   downloadingAll.value = true
   try {
     await saveUrlsPreferFolder(
       images.map((url, i) => ({
         url,
         label: `图${i + 1}/${images.length} · ${result.title?.trim() || '未命名图文'}`,
-        raw
+        kind: 'image' as const,
+        imageIndex: i
       }))
     )
   } catch (err) {
@@ -583,7 +809,7 @@ async function onDownloadAll() {
   if (downloadingAll.value) return
   downloadingAll.value = true
   try {
-    await saveUrlsPreferFolder(jobs)
+    await saveJobsWithLiveRefresh(jobs)
   } catch (err) {
     message.error(err instanceof Error ? err.message : '批量保存失败')
   } finally {
@@ -596,19 +822,88 @@ async function onDownloadAll() {
 }
 
 async function retryDownloadFailed() {
-  const jobs = downloadFailList.value.map((i) => ({
-    url: i.url,
-    label: i.label,
-    raw: i.raw
-  }))
-  if (!jobs.length) {
+  const fails = [...downloadFailList.value]
+  if (!fails.length) {
     message.warning('当前没有下载失败项')
     return
   }
   if (downloadingAll.value) return
   downloadingAll.value = true
   try {
-    await saveUrlsPreferFolder(jobs)
+    // 失败重试：先强制按条目重新解析，再用新链接下载
+    const jobs: DownloadJob[] = []
+    const groups = new Map<string, DownloadFailItem[]>()
+    for (const fail of fails) {
+      const key = fail.itemId || fail.raw || fail.url
+      if (!groups.has(key)) groups.set(key, [])
+      groups.get(key)!.push(fail)
+    }
+
+    downloadSaveTotal.value = fails.length
+    downloadSaveDone.value = 0
+
+    for (const groupFails of groups.values()) {
+      const seed = groupFails[0]
+      let item = findQueueItemForJob(seed)
+      if (!item && seed.raw?.trim()) {
+        // 队列里没有时无法重解析，沿用旧 url
+        for (const f of groupFails) {
+          jobs.push({
+            url: f.url,
+            label: f.label,
+            raw: f.raw,
+            itemId: f.itemId,
+            kind: f.kind,
+            imageIndex: f.imageIndex
+          })
+        }
+        continue
+      }
+      if (item) {
+        downloadSaveLabel.value = `重试前重新解析：${shortUrl(item.raw)}`
+        const ok = await ensureFreshForDownload(item, true)
+        if (!ok) {
+          // 保留在失败列表（后面 sync 时会写回）
+          for (const f of groupFails) {
+            jobs.push({
+              url: f.url,
+              label: f.label,
+              raw: f.raw,
+              itemId: f.itemId,
+              kind: f.kind,
+              imageIndex: f.imageIndex
+            })
+          }
+          continue
+        }
+        const index = queue.value.findIndex((q) => q.id === item!.id)
+        for (const f of groupFails) {
+          const mapped = resolveJobAfterRefresh(item, {
+            url: f.url,
+            label: f.label,
+            raw: f.raw,
+            itemId: f.itemId,
+            kind: f.kind,
+            imageIndex: f.imageIndex
+          })
+          if (mapped) {
+            jobs.push(mapped)
+          } else {
+            // 图集数量变化等：把该条整项可下载内容补上一次
+            const all = jobsFromQueueItem(item, index >= 0 ? index : 0)
+            for (const j of all) {
+              if (!jobs.some((x) => failKey(x) === failKey(j))) jobs.push(j)
+            }
+          }
+        }
+      }
+    }
+
+    if (!jobs.length) {
+      message.error('重新解析后仍无可下载内容')
+      return
+    }
+    await saveJobsWithLiveRefresh(jobs)
   } catch (err) {
     message.error(err instanceof Error ? err.message : '重试保存失败')
   } finally {
@@ -624,7 +919,35 @@ async function retryOneDownload(item: DownloadFailItem) {
   if (downloadingAll.value) return
   downloadingAll.value = true
   try {
-    await saveUrlsPreferFolder([{ url: item.url, label: item.label, raw: item.raw }])
+    const queueItem = findQueueItemForJob(item)
+    if (queueItem) {
+      downloadSaveLabel.value = `重试前重新解析：${shortUrl(queueItem.raw)}`
+      await ensureFreshForDownload(queueItem, true)
+      if (queueItem.status === 'done' && queueItem.result) {
+        const mapped = resolveJobAfterRefresh(queueItem, {
+          url: item.url,
+          label: item.label,
+          raw: item.raw,
+          itemId: item.itemId,
+          kind: item.kind,
+          imageIndex: item.imageIndex
+        })
+        if (mapped) {
+          await saveJobsWithLiveRefresh([mapped])
+          return
+        }
+      }
+    }
+    await saveJobsWithLiveRefresh([
+      {
+        url: item.url,
+        label: item.label,
+        raw: item.raw,
+        itemId: item.itemId,
+        kind: item.kind,
+        imageIndex: item.imageIndex
+      }
+    ])
   } catch (err) {
     message.error(err instanceof Error ? err.message : '重试保存失败')
   } finally {
@@ -689,7 +1012,7 @@ async function retryFailed() {
         <p class="brand">清影解析</p>
         <h1 class="headline">粘贴分享链接，批量获取可预览与下载的视频 / 图集</h1>
         <p class="sub">
-          支持抖音、小红书。一次最多 {{ MAX_QUEUE }} 条；结果较多时默认折叠，可按需展开或下载全部。
+          支持抖音、小红书。一次最多 {{ MAX_QUEUE }} 条；下载全部时若链接临近过期会自动重新解析。
         </p>
       </header>
 
@@ -894,7 +1217,7 @@ async function retryFailed() {
             <p class="download-fail-title">下载失败重试列表（{{ downloadFailCount }}）</p>
             <div class="download-fail-actions">
               <NButton size="tiny" secondary @click="copyDownloadFailedTexts">
-                复制失败文案
+                复制失败文案列表
               </NButton>
               <NButton
                 size="tiny"
@@ -917,7 +1240,7 @@ async function retryFailed() {
             </div>
           </div>
           <ul class="download-fail-list">
-            <li v-for="(failItem, failIndex) in downloadFailList" :key="`${failItem.url}-${failIndex}`">
+            <li v-for="(failItem, failIndex) in downloadFailList" :key="`${failKey(failItem)}-${failIndex}`">
               <div class="download-fail-meta">
                 <span class="download-fail-label">{{ failItem.label || `第 ${failIndex + 1} 项` }}</span>
                 <span class="download-fail-reason">{{ failItem.reason }}</span>
@@ -935,7 +1258,7 @@ async function retryFailed() {
                   type="button"
                   class="link-btn"
                   :disabled="downloadingAll"
-                  @click="removeDownloadFail(failItem.url)"
+                  @click="removeDownloadFail(failItem)"
                 >
                   移除
                 </button>

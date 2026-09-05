@@ -35,6 +35,15 @@ export type FolderSaveOutcome =
     }
   | { mode: 'unsupported' }
 
+export type PickFolderResult =
+  | { ok: true; dir: FileSystemDirectoryHandle }
+  | { ok: false; cancelled: true }
+  | { ok: false; unsupported: true }
+
+export type WriteOneResult =
+  | { ok: true; name: string; label: string }
+  | { ok: false; url: string; label: string; reason: string }
+
 /** 单文件拉取+写入上限；超时则跳过，保证整批能跑完 */
 const DOWNLOAD_TIMEOUT_MS = 90_000
 
@@ -52,6 +61,11 @@ function pickerWindow(): DirectoryPickerWindow {
 
 export function canUseDirectoryPicker(): boolean {
   return typeof pickerWindow().showDirectoryPicker === 'function'
+}
+
+/** 是否像代理 token 过期 / 资源不存在（可触发重新解析） */
+export function isExpiredDownloadReason(reason: string): boolean {
+  return /HTTP\s*404|过期|不存在|NOT_FOUND|资源无效/i.test(reason)
 }
 
 function sanitizeFilename(name: string): string {
@@ -197,40 +211,69 @@ function normalizeItems(urlsOrItems: Array<string | FolderSaveItem>): FolderSave
   return urlsOrItems.map((item) => (typeof item === 'string' ? { url: item } : item))
 }
 
+/** 在用户点击手势内调用：弹出选目录。 */
+export async function pickDownloadFolder(): Promise<PickFolderResult> {
+  const showPicker = pickerWindow().showDirectoryPicker
+  if (!showPicker) return { ok: false, unsupported: true }
+  try {
+    const dir = await showPicker({ id: 'media-parse-downloads', mode: 'readwrite' })
+    return { ok: true, dir }
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      return { ok: false, cancelled: true }
+    }
+    throw err
+  }
+}
+
 /**
- * 在用户点击手势内调用：弹出选目录，再逐个 fetch 写入。
- * 单文件超时会跳过并继续，整批一定会结束。
- * 不支持 API 时返回 unsupported，由调用方降级。
+ * 将单个 URL 写入已选目录。
+ * usedNames 可跨多次调用共享，避免文件名冲突。
  */
-export async function saveUrlsToPickedFolder(
+export async function writeOneUrlToDirectory(
+  dir: FileSystemDirectoryHandle,
+  item: FolderSaveItem,
+  options?: {
+    index?: number
+    usedNames?: Set<string>
+    timeoutMs?: number
+  }
+): Promise<WriteOneResult> {
+  const index = options?.index ?? 0
+  const usedNames = options?.usedNames ?? new Set<string>()
+  const timeoutMs = options?.timeoutMs ?? DOWNLOAD_TIMEOUT_MS
+  const label = item.label?.trim() || `第 ${index + 1} 个文件（${shortUrlHint(item.url)}）`
+  const timeout = createTimeout(timeoutMs)
+  try {
+    const name = await writeUrlToDirectory(dir, item.url, index, usedNames, timeout.signal)
+    return { ok: true, name, label }
+  } catch (err) {
+    return { ok: false, url: item.url, label, reason: failReason(err) }
+  } finally {
+    timeout.clear()
+    await yieldToUi()
+  }
+}
+
+/** 向已选目录批量写入（不弹选目录）。 */
+export async function writeUrlsToDirectory(
+  dir: FileSystemDirectoryHandle,
   urlsOrItems: Array<string | FolderSaveItem>,
   options?: {
     onProgress?: (progress: FolderSaveProgress) => void
     timeoutMs?: number
+    usedNames?: Set<string>
+    /** 文件名序号起点，默认 0 */
+    startIndex?: number
   }
-): Promise<FolderSaveOutcome> {
-  const showPicker = pickerWindow().showDirectoryPicker
-  if (!showPicker) return { mode: 'unsupported' }
-
+): Promise<{ ok: number; fail: number; failed: FolderSaveFailedItem[] }> {
   const items = normalizeItems(urlsOrItems)
-  if (!items.length) return { mode: 'folder', ok: 0, fail: 0, failed: [] }
-
-  let dir: FileSystemDirectoryHandle
-  try {
-    dir = await showPicker({ id: 'media-parse-downloads', mode: 'readwrite' })
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      return { mode: 'folder', cancelled: true }
-    }
-    throw err
-  }
-
   let ok = 0
   let fail = 0
-  const total = items.length
-  const usedNames = new Set<string>()
   const failed: FolderSaveFailedItem[] = []
-  const timeoutMs = options?.timeoutMs ?? DOWNLOAD_TIMEOUT_MS
+  const usedNames = options?.usedNames ?? new Set<string>()
+  const startIndex = options?.startIndex ?? 0
+  const total = items.length
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i]
@@ -244,22 +287,25 @@ export async function saveUrlsToPickedFolder(
       phase: 'start'
     })
 
-    const timeout = createTimeout(timeoutMs)
-    try {
-      const name = await writeUrlToDirectory(dir, item.url, i, usedNames, timeout.signal)
+    const result = await writeOneUrlToDirectory(dir, item, {
+      index: startIndex + i,
+      usedNames,
+      timeoutMs: options?.timeoutMs
+    })
+
+    if (result.ok) {
       ok += 1
       options?.onProgress?.({
         done: i + 1,
         total,
         currentIndex: i + 1,
         currentLabel: label,
-        currentName: name,
+        currentName: result.name,
         phase: 'ok'
       })
-    } catch (err) {
-      const reason = failReason(err)
+    } else {
       fail += 1
-      failed.push({ url: item.url, label, reason })
+      failed.push({ url: result.url, label: result.label, reason: result.reason })
       options?.onProgress?.({
         done: i + 1,
         total,
@@ -267,14 +313,35 @@ export async function saveUrlsToPickedFolder(
         currentLabel: label,
         currentName: label,
         phase: 'fail',
-        failReason: reason
+        failReason: result.reason
       })
-    } finally {
-      timeout.clear()
     }
-
-    await yieldToUi()
   }
 
-  return { mode: 'folder', ok, fail, failed }
+  return { ok, fail, failed }
+}
+
+/**
+ * 在用户点击手势内调用：弹出选目录，再逐个 fetch 写入。
+ * 单文件超时会跳过并继续，整批一定会结束。
+ * 不支持 API 时返回 unsupported，由调用方降级。
+ */
+export async function saveUrlsToPickedFolder(
+  urlsOrItems: Array<string | FolderSaveItem>,
+  options?: {
+    onProgress?: (progress: FolderSaveProgress) => void
+    timeoutMs?: number
+  }
+): Promise<FolderSaveOutcome> {
+  const picked = await pickDownloadFolder()
+  if (!picked.ok) {
+    if ('unsupported' in picked && picked.unsupported) return { mode: 'unsupported' }
+    return { mode: 'folder', cancelled: true }
+  }
+
+  const items = normalizeItems(urlsOrItems)
+  if (!items.length) return { mode: 'folder', ok: 0, fail: 0, failed: [] }
+
+  const result = await writeUrlsToDirectory(picked.dir, items, options)
+  return { mode: 'folder', ok: result.ok, fail: result.fail, failed: result.failed }
 }
