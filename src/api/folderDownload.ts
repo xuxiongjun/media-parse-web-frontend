@@ -17,6 +17,13 @@ export type FolderSaveItem = {
   label?: string
 }
 
+export type FolderSaveFailedItem = {
+  /** 写入时使用的下载 URL（与入参一致） */
+  url: string
+  label: string
+  reason: string
+}
+
 export type FolderSaveOutcome =
   | { mode: 'folder'; cancelled: true }
   | {
@@ -24,7 +31,7 @@ export type FolderSaveOutcome =
       cancelled?: false
       ok: number
       fail: number
-      failed: Array<{ label: string; reason: string }>
+      failed: FolderSaveFailedItem[]
     }
   | { mode: 'unsupported' }
 
@@ -222,7 +229,7 @@ export async function saveUrlsToPickedFolder(
   let fail = 0
   const total = items.length
   const usedNames = new Set<string>()
-  const failed: Array<{ label: string; reason: string }> = []
+  const failed: FolderSaveFailedItem[] = []
   const timeoutMs = options?.timeoutMs ?? DOWNLOAD_TIMEOUT_MS
 
   for (let i = 0; i < items.length; i++) {
@@ -252,7 +259,7 @@ export async function saveUrlsToPickedFolder(
     } catch (err) {
       const reason = failReason(err)
       fail += 1
-      failed.push({ label, reason })
+      failed.push({ url: item.url, label, reason })
       options?.onProgress?.({
         done: i + 1,
         total,

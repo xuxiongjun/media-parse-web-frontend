@@ -33,6 +33,13 @@ interface QueueItem {
   error: string | null
 }
 
+/** 批量下载失败，供用户再次触发保存 */
+interface DownloadFailItem {
+  url: string
+  label: string
+  reason: string
+}
+
 const message = useMessage()
 const draft = ref('')
 const queue = ref<QueueItem[]>([])
@@ -42,6 +49,7 @@ const downloadSaveDone = ref(0)
 const downloadSaveTotal = ref(0)
 const downloadSaveLabel = ref('')
 const downloadSaveFailHint = ref('')
+const downloadFailList = ref<DownloadFailItem[]>([])
 const progressDone = ref(0)
 const progressTotal = ref(0)
 const expandedNames = ref<string[]>([])
@@ -97,6 +105,7 @@ const successCount = computed(() => queue.value.filter((i) => i.status === 'done
 const failCount = computed(() => queue.value.filter((i) => i.status === 'error').length)
 const doneItems = computed(() => queue.value.filter((i) => i.status === 'done' || i.status === 'error'))
 const downloadableCount = computed(() => collectDownloadUrls().length)
+const downloadFailCount = computed(() => downloadFailList.value.length)
 const highlightId = ref<string | null>(null)
 let highlightTimer: number | undefined
 
@@ -186,6 +195,7 @@ function onClear() {
   progressTotal.value = 0
   expandedNames.value = []
   highlightId.value = null
+  downloadFailList.value = []
   if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
 }
 
@@ -437,6 +447,24 @@ async function downloadUrlsSequentially(urls: string[], gapMs = 450) {
   }
 }
 
+/** 本轮尝试后同步失败重试列表：成功的移出，仍失败的写入/更新 */
+function syncDownloadFailsAfterSave(
+  attempted: Array<{ url: string; label?: string }>,
+  failed: DownloadFailItem[]
+) {
+  const attemptedSet = new Set(attempted.map((a) => a.url))
+  const kept = downloadFailList.value.filter((i) => !attemptedSet.has(i.url))
+  downloadFailList.value = [...kept, ...failed]
+}
+
+function clearDownloadFails() {
+  downloadFailList.value = []
+}
+
+function removeDownloadFail(url: string) {
+  downloadFailList.value = downloadFailList.value.filter((i) => i.url !== url)
+}
+
 /** 优先选文件夹写入；不支持时降级为逐个触发浏览器下载 */
 async function saveUrlsPreferFolder(
   jobs: Array<{ url: string; label?: string }> | string[]
@@ -449,38 +477,43 @@ async function saveUrlsPreferFolder(
   downloadSaveFailHint.value = ''
 
   if (canUseDirectoryPicker()) {
-    const outcome = await saveUrlsToPickedFolder(
-      items.map((j) => ({
-        url: mediaDownloadUrl(j.url),
-        label: j.label
-      })),
-      {
-        onProgress: (p) => {
-          downloadSaveDone.value = p.done
-          downloadSaveTotal.value = p.total
-          downloadSaveLabel.value = p.currentLabel || p.currentName || ''
-          if (p.phase === 'fail' && p.failReason) {
-            downloadSaveFailHint.value = `已跳过：${p.currentLabel || ''}（${p.failReason}）`
-          }
+    const downloadItems = items.map((j) => ({
+      url: mediaDownloadUrl(j.url),
+      label: j.label
+    }))
+    const dlToOrig = new Map(downloadItems.map((d, i) => [d.url, items[i]] as const))
+    const outcome = await saveUrlsToPickedFolder(downloadItems, {
+      onProgress: (p) => {
+        downloadSaveDone.value = p.done
+        downloadSaveTotal.value = p.total
+        downloadSaveLabel.value = p.currentLabel || p.currentName || ''
+        if (p.phase === 'fail' && p.failReason) {
+          downloadSaveFailHint.value = `已跳过：${p.currentLabel || ''}（${p.failReason}）`
         }
       }
-    )
+    })
     if (outcome.mode === 'folder' && outcome.cancelled) {
       message.info('已取消选择文件夹')
       return
     }
     if (outcome.mode === 'folder') {
+      const failedJobs: DownloadFailItem[] = outcome.failed.map((f) => {
+        const orig = dlToOrig.get(f.url)
+        return {
+          url: orig?.url ?? f.url,
+          label: f.label || orig?.label || '',
+          reason: f.reason
+        }
+      })
+      syncDownloadFailsAfterSave(items, failedJobs)
+
       if (outcome.fail === 0) {
         message.success(`已保存 ${outcome.ok} 个文件到所选文件夹`)
       } else if (outcome.ok === 0) {
-        message.error(`全部保存失败（${outcome.fail} 个）`)
+        message.error(`全部保存失败，已加入失败重试列表（${outcome.fail}）`)
       } else {
-        const sample = outcome.failed
-          .slice(0, 3)
-          .map((f) => f.label)
-          .join('；')
         message.warning(
-          `已保存 ${outcome.ok} 个，跳过 ${outcome.fail} 个${sample ? `（如 ${sample}）` : ''}`
+          `已保存 ${outcome.ok} 个，${outcome.fail} 个已加入失败重试列表`
         )
       }
       return
@@ -527,6 +560,43 @@ async function onDownloadAll() {
     await saveUrlsPreferFolder(jobs)
   } catch (err) {
     message.error(err instanceof Error ? err.message : '批量保存失败')
+  } finally {
+    downloadingAll.value = false
+    downloadSaveDone.value = 0
+    downloadSaveTotal.value = 0
+    downloadSaveLabel.value = ''
+    downloadSaveFailHint.value = ''
+  }
+}
+
+async function retryDownloadFailed() {
+  const jobs = downloadFailList.value.map((i) => ({ url: i.url, label: i.label }))
+  if (!jobs.length) {
+    message.warning('当前没有下载失败项')
+    return
+  }
+  if (downloadingAll.value) return
+  downloadingAll.value = true
+  try {
+    await saveUrlsPreferFolder(jobs)
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '重试保存失败')
+  } finally {
+    downloadingAll.value = false
+    downloadSaveDone.value = 0
+    downloadSaveTotal.value = 0
+    downloadSaveLabel.value = ''
+    downloadSaveFailHint.value = ''
+  }
+}
+
+async function retryOneDownload(item: DownloadFailItem) {
+  if (downloadingAll.value) return
+  downloadingAll.value = true
+  try {
+    await saveUrlsPreferFolder([{ url: item.url, label: item.label }])
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '重试保存失败')
   } finally {
     downloadingAll.value = false
     downloadSaveDone.value = 0
@@ -754,6 +824,17 @@ async function retryFailed() {
               重试失败（{{ failCount }}）
             </NButton>
             <NButton
+              v-if="downloadFailCount > 0"
+              size="small"
+              type="warning"
+              secondary
+              :loading="downloadingAll"
+              :disabled="downloadingAll || loading"
+              @click="retryDownloadFailed"
+            >
+              重试下载失败（{{ downloadFailCount }}）
+            </NButton>
+            <NButton
               size="small"
               type="primary"
               :loading="downloadingAll"
@@ -777,6 +858,58 @@ async function retryFailed() {
         <p v-if="downloadingAll && downloadSaveFailHint" class="download-skip">
           {{ downloadSaveFailHint }}
         </p>
+
+        <div v-if="downloadFailCount" class="download-fail-panel">
+          <div class="download-fail-head">
+            <p class="download-fail-title">下载失败重试列表（{{ downloadFailCount }}）</p>
+            <div class="download-fail-actions">
+              <NButton
+                size="tiny"
+                quaternary
+                :disabled="downloadingAll"
+                @click="clearDownloadFails"
+              >
+                清空
+              </NButton>
+              <NButton
+                size="tiny"
+                type="warning"
+                secondary
+                :loading="downloadingAll"
+                :disabled="downloadingAll || loading"
+                @click="retryDownloadFailed"
+              >
+                全部重试下载
+              </NButton>
+            </div>
+          </div>
+          <ul class="download-fail-list">
+            <li v-for="(failItem, failIndex) in downloadFailList" :key="`${failItem.url}-${failIndex}`">
+              <div class="download-fail-meta">
+                <span class="download-fail-label">{{ failItem.label || `第 ${failIndex + 1} 项` }}</span>
+                <span class="download-fail-reason">{{ failItem.reason }}</span>
+              </div>
+              <div class="download-fail-item-act">
+                <button
+                  type="button"
+                  class="link-btn"
+                  :disabled="downloadingAll"
+                  @click="retryOneDownload(failItem)"
+                >
+                  重试
+                </button>
+                <button
+                  type="button"
+                  class="link-btn"
+                  :disabled="downloadingAll"
+                  @click="removeDownloadFail(failItem.url)"
+                >
+                  移除
+                </button>
+              </div>
+            </li>
+          </ul>
+        </div>
 
         <NCollapse v-model:expanded-names="expandedNames" display-directive="if">
           <NCollapseItem
@@ -1092,9 +1225,95 @@ async function retryFailed() {
   color: var(--danger);
 }
 
+.download-fail-panel {
+  margin: 0 4px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--line));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--danger) 8%, rgba(16, 32, 28, 0.72));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.download-fail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.download-fail-title {
+  margin: 0;
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.download-fail-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.download-fail-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.download-fail-list li {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.download-fail-list li:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.download-fail-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.download-fail-label {
+  font-size: 0.86rem;
+  color: var(--ink);
+  word-break: break-word;
+}
+
+.download-fail-reason {
+  font-size: 0.8rem;
+  color: var(--danger);
+  word-break: break-word;
+}
+
+.download-fail-item-act {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+
 .toolbar-actions {
   display: flex;
   gap: 4px;
+  flex-wrap: wrap;
 }
 
 .results-wrap :deep(.n-collapse) {
