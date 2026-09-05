@@ -1,5 +1,5 @@
-# Render Blueprint — 前端静态站
-# 先部署后端拿到 https://xxx.onrender.com，再把下面 VITE_API_BASE 改成该地址后部署
+# 前端请创建 Static Site（不要选 Docker Web Service）
+# New → Static Site → 连接本仓库后按下列配置
 services:
   - type: web
     name: media-parse-web
@@ -8,5 +8,5 @@ services:
     staticPublishPath: dist
     envVars:
       - key: VITE_API_BASE
-        # 改成你的后端公网地址，不要末尾斜杠
-        value: https://media-parse-web-server.onrender.com
+        # 在 Dashboard 里改成你的后端地址，例如 https://media-parse-web-server-xxxx.onrender.com
+        sync: false
