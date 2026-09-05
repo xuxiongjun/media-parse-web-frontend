@@ -1,0 +1,12 @@
+# Render Blueprint — 前端静态站
+# 先部署后端拿到 https://xxx.onrender.com，再把下面 VITE_API_BASE 改成该地址后部署
+services:
+  - type: web
+    name: media-parse-web
+    runtime: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE
+        # 改成你的后端公网地址，不要末尾斜杠
+        value: https://media-parse-web-server.onrender.com

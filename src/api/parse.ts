@@ -17,18 +17,42 @@ export interface ApiErrorBody {
   message?: string
 }
 
+/** 线上前后端分离时在构建环境设置，如 https://xxx.onrender.com；本地留空走同源 /api */
+export const API_BASE = String(import.meta.env.VITE_API_BASE || '')
+  .trim()
+  .replace(/\/$/, '')
+
 const http = axios.create({
+  baseURL: API_BASE || undefined,
   timeout: 45000
 })
 
+/** 把后端返回的相对路径补成可访问的绝对地址 */
+export function resolveApiUrl(path: string | undefined | null): string {
+  if (!path) return ''
+  if (/^https?:\/\//i.test(path)) return path
+  const normalized = path.startsWith('/') ? path : `/${path}`
+  return `${API_BASE}${normalized}`
+}
+
+function withAbsoluteMediaUrls(data: ParseResult): ParseResult {
+  return {
+    ...data,
+    coverProxyUrl: data.coverProxyUrl ? resolveApiUrl(data.coverProxyUrl) : data.coverProxyUrl,
+    videoProxyUrl: data.videoProxyUrl ? resolveApiUrl(data.videoProxyUrl) : data.videoProxyUrl,
+    imageProxyUrls: data.imageProxyUrls?.map((u) => resolveApiUrl(u))
+  }
+}
+
 export async function parseShareUrl(url: string): Promise<ParseResult> {
   const { data } = await http.post<ParseResult>('/api/parse', { url })
-  return data
+  return withAbsoluteMediaUrls(data)
 }
 
 export function mediaDownloadUrl(proxyPath: string): string {
-  const joiner = proxyPath.includes('?') ? '&' : '?'
-  return `${proxyPath}${joiner}download=1`
+  const absolute = resolveApiUrl(proxyPath)
+  const joiner = absolute.includes('?') ? '&' : '?'
+  return `${absolute}${joiner}download=1`
 }
 
 /**
@@ -38,7 +62,6 @@ export function mediaDownloadUrl(proxyPath: string): string {
 export function triggerBrowserDownload(url: string, filename?: string) {
   const a = document.createElement('a')
   a.href = url
-  // 不写死文件名，交给服务端 Content-Disposition；有传入名时再覆盖
   if (filename) a.download = filename
   else a.setAttribute('download', '')
   a.rel = 'noopener'
