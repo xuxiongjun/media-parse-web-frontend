@@ -60,8 +60,11 @@ interface DownloadJob {
   imageIndex?: number
 }
 
-/** 与后端 app.media-token-ttl-seconds（3600 / 1 小时）对齐：剩余不足此时长则先重新解析 */
-const TOKEN_REFRESH_MARGIN_MS = 3_600_000
+/**
+   * 代理 token TTL 为 1 小时（app.media-token-ttl-seconds=3600）。
+   * 仅在剩余不足该余量时提前刷新；勿设成整段 TTL，否则解析后几乎立刻被判定为即将过期。
+   */
+const TOKEN_REFRESH_MARGIN_MS = 5 * 60_000
 
 const message = useMessage()
 const dialog = useDialog()
