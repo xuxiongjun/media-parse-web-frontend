@@ -439,9 +439,29 @@ async function onBatchParse() {
     await nextTick()
     const ok = successCount.value
     const bad = failCount.value
-    if (ok && !bad) message.success(`全部解析成功（${ok}）`)
-    else if (ok && bad) message.warning(`完成：成功 ${ok}，失败 ${bad}`)
-    else message.error(`全部失败（${bad}）`)
+    if (ok && !bad) {
+      dialog?.info({
+        title: '解析完成',
+        content: '链接已经全部解析完成，是否下载全部',
+        positiveText: '下载全部',
+        negativeText: '暂不',
+        onPositiveClick: () => {
+          void onDownloadAll()
+        }
+      })
+    } else if (ok && bad) {
+      dialog?.info({
+        title: '解析完成',
+        content: `完成：成功 ${ok}，失败 ${bad}。是否下载已成功解析的内容？`,
+        positiveText: '下载全部',
+        negativeText: '暂不',
+        onPositiveClick: () => {
+          void onDownloadAll()
+        }
+      })
+    } else {
+      message.error(`全部失败（${bad}）`)
+    }
   } finally {
     loading.value = false
   }
