@@ -79,8 +79,12 @@ const downloadSaveFailHint = ref('')
 const downloadFailList = ref<DownloadFailItem[]>([])
 const progressDone = ref(0)
 const progressTotal = ref(0)
+const progressPanelRef = ref<HTMLElement | null>(null)
+const progressPanelInView = ref(true)
 const expandedNames = ref<string[]>([])
 const showBackTop = ref(false)
+
+let progressObserver: IntersectionObserver | null = null
 
 /** 单次批量上限，避免过长列表拖垮页面与接口 */
 const MAX_QUEUE = 99
@@ -161,6 +165,9 @@ const progressPercent = computed(() => {
   if (!progressTotal.value) return 0
   return Math.round((progressDone.value / progressTotal.value) * 100)
 })
+const showFloatingParseProgress = computed(
+  () => loading.value && progressTotal.value > 0 && !progressPanelInView.value
+)
 const successCount = computed(() => queue.value.filter((i) => i.status === 'done').length)
 const failCount = computed(() => queue.value.filter((i) => i.status === 'error').length)
 const doneItems = computed(() => queue.value.filter((i) => i.status === 'done' || i.status === 'error'))
@@ -187,6 +194,30 @@ function scrollToTop() {
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
+function scrollToProgress() {
+  progressPanelRef.value?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
+function bindProgressObserver(el: HTMLElement | null) {
+  progressObserver?.disconnect()
+  progressObserver = null
+  if (!el) {
+    progressPanelInView.value = true
+    return
+  }
+  progressObserver = new IntersectionObserver(
+    ([entry]) => {
+      progressPanelInView.value = entry.isIntersecting
+    },
+    { threshold: 0.15, rootMargin: '0px' }
+  )
+  progressObserver.observe(el)
+}
+
+watch(progressPanelRef, (el) => {
+  bindProgressObserver(el)
+})
+
 onMounted(() => {
   window.addEventListener('scroll', onWindowScroll, { passive: true })
   onWindowScroll()
@@ -194,6 +225,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('scroll', onWindowScroll)
+  progressObserver?.disconnect()
+  progressObserver = null
   if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
 })
 
@@ -1277,7 +1310,11 @@ async function retryFailed() {
         </div>
       </section>
 
-      <section v-if="loading || progressTotal > 0" class="panel progress-panel">
+      <section
+        v-if="loading || progressTotal > 0"
+        ref="progressPanelRef"
+        class="panel progress-panel"
+      >
         <div class="progress-meta">
           <span>{{ loading ? '正在批量解析…' : '本轮解析进度' }}</span>
           <span>{{ progressDone }} / {{ progressTotal }}</span>
@@ -1520,15 +1557,33 @@ async function retryFailed() {
       </footer>
     </main>
 
-    <button
-      v-show="showBackTop"
-      type="button"
-      class="back-top"
-      aria-label="回到顶部"
-      @click="scrollToTop"
-    >
-      ↑
-    </button>
+    <div class="fab-stack">
+      <button
+        v-show="showFloatingParseProgress"
+        type="button"
+        class="parse-progress-fab"
+        :aria-label="`解析进度 ${progressPercent}%，点击跳转到进度条`"
+        @click="scrollToProgress"
+      >
+        <NProgress
+          type="circle"
+          :percentage="progressPercent"
+          :processing="loading"
+          :stroke-width="8"
+          :show-indicator="true"
+          class="parse-progress-ring"
+        />
+      </button>
+      <button
+        v-show="showBackTop"
+        type="button"
+        class="back-top"
+        aria-label="回到顶部"
+        @click="scrollToTop"
+      >
+        ↑
+      </button>
+    </div>
   </div>
 </template>
 
@@ -2023,11 +2078,52 @@ async function retryFailed() {
   line-height: 1.55;
 }
 
-.back-top {
+.fab-stack {
   position: fixed;
   right: 56px;
   bottom: 28px;
   z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.parse-progress-fab {
+  width: 58px;
+  height: 58px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: rgba(16, 32, 28, 0.92);
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+  display: grid;
+  place-items: center;
+  transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.parse-progress-fab:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  transform: translateY(-2px);
+}
+
+.parse-progress-fab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.parse-progress-ring {
+  width: 46px !important;
+}
+
+.parse-progress-ring :deep(.n-progress-text) {
+  font-size: 0.68rem !important;
+  color: var(--accent) !important;
+}
+
+.back-top {
   width: 58px;
   height: 58px;
   border: 1px solid var(--line);
@@ -2058,11 +2154,22 @@ async function retryFailed() {
     padding: 20px 12px 32px;
   }
 
-  .back-top {
+  .fab-stack {
     right: 36px;
     bottom: 22px;
+  }
+
+  .parse-progress-fab,
+  .back-top {
     width: 52px;
     height: 52px;
+  }
+
+  .parse-progress-ring {
+    width: 40px !important;
+  }
+
+  .back-top {
     font-size: 1.3rem;
   }
 
