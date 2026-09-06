@@ -256,6 +256,14 @@ function onClear() {
   if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
 }
 
+function flashHighlight(id: string) {
+  highlightId.value = id
+  if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
+  highlightTimer = window.setTimeout(() => {
+    if (highlightId.value === id) highlightId.value = null
+  }, 1600)
+}
+
 async function locateResult(item: QueueItem) {
   if (item.status !== 'done' && item.status !== 'error') {
     message.warning('该条尚未出现在解析结果中')
@@ -273,11 +281,18 @@ async function locateResult(item: QueueItem) {
     return
   }
   el.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  highlightId.value = item.id
-  if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
-  highlightTimer = window.setTimeout(() => {
-    if (highlightId.value === item.id) highlightId.value = null
-  }, 1600)
+  flashHighlight(item.id)
+}
+
+async function locateQueueRow(item: QueueItem) {
+  await nextTick()
+  const el = document.getElementById(`queue-${item.id}`)
+  if (!el) {
+    message.warning('未找到对应表格行')
+    return
+  }
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  flashHighlight(item.id)
 }
 
 function shortUrl(raw: string): string {
@@ -1136,7 +1151,14 @@ async function retryFailed() {
             <span class="col-status">状态</span>
             <span class="col-act">操作</span>
           </div>
-          <div v-for="(item, index) in queue" :key="item.id" class="queue-row" role="row">
+          <div
+            v-for="(item, index) in queue"
+            :id="`queue-${item.id}`"
+            :key="item.id"
+            class="queue-row"
+            :class="{ 'is-target': highlightId === item.id }"
+            role="row"
+          >
             <span class="col-idx">{{ index + 1 }}</span>
             <div class="col-raw">
               <NInput
@@ -1327,6 +1349,13 @@ async function retryFailed() {
                 :class="{ 'is-target': highlightId === item.id }"
                 aria-hidden="true"
               />
+              <button
+                type="button"
+                class="link-btn locate-queue-btn"
+                @click.stop="locateQueueRow(item)"
+              >
+                回到表格
+              </button>
             </template>
             <div v-if="item.status === 'error'" class="error-body">
               <p>{{ item.error || '解析失败' }}</p>
@@ -1530,6 +1559,15 @@ async function retryFailed() {
   grid-template-columns: 40px minmax(0, 1fr) 64px auto;
   gap: 12px;
   align-items: center;
+  scroll-margin-top: 16px;
+  scroll-margin-bottom: 16px;
+  transition: box-shadow 0.35s ease, background-color 0.35s ease;
+}
+
+.queue-row.is-target {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 .queue-head {
@@ -1753,6 +1791,18 @@ async function retryFailed() {
   color: var(--ink);
 }
 
+.results-wrap :deep(.n-collapse-item__header-extra) {
+  display: flex;
+  align-items: center;
+  margin-left: 12px;
+}
+
+.locate-queue-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
 .results-wrap :deep(.n-collapse-item__content-inner) {
   padding: 0 16px 16px;
 }
@@ -1900,16 +1950,16 @@ async function retryFailed() {
 
 .back-top {
   position: fixed;
-  right: 20px;
-  bottom: 24px;
+  right: 56px;
+  bottom: 28px;
   z-index: 40;
-  width: 44px;
-  height: 44px;
+  width: 58px;
+  height: 58px;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: 14px;
   background: rgba(16, 32, 28, 0.92);
   color: var(--accent);
-  font-size: 1.15rem;
+  font-size: 1.45rem;
   line-height: 1;
   cursor: pointer;
   box-shadow: var(--shadow);
@@ -1934,10 +1984,11 @@ async function retryFailed() {
   }
 
   .back-top {
-    right: 14px;
-    bottom: 18px;
-    width: 40px;
-    height: 40px;
+    right: 36px;
+    bottom: 22px;
+    width: 52px;
+    height: 52px;
+    font-size: 1.3rem;
   }
 
   .result {
