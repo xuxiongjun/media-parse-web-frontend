@@ -358,13 +358,13 @@ async function parseOne(item: QueueItem) {
 async function onBatchParse() {
   if (loading.value) return
 
-  if (!queue.value.length) {
-    const collected = collectShareEntries(draft.value)
-    if (!collected.length) {
-      message.warning('请先粘贴链接，或整理到下方列表')
-      return
-    }
+  // 粘贴区有可识别链接时，始终覆盖待解析列表（避免二次粘贴仍用旧队列）
+  const collected = collectShareEntries(draft.value)
+  if (collected.length) {
     queue.value = takeEntriesWithCap(collected).map(makeItem)
+  } else if (!queue.value.length) {
+    message.warning('请先粘贴链接，或整理到下方列表')
+    return
   } else if (queue.value.length > MAX_QUEUE) {
     const dropped = queue.value.length - MAX_QUEUE
     queue.value = queue.value.slice(0, MAX_QUEUE)
