@@ -1,5 +1,11 @@
 <script setup lang="ts">
-import { NConfigProvider, NMessageProvider, darkTheme, type GlobalThemeOverrides } from 'naive-ui'
+import {
+  NConfigProvider,
+  NDialogProvider,
+  NMessageProvider,
+  darkTheme,
+  type GlobalThemeOverrides
+} from 'naive-ui'
 import HomeView from './views/HomeView.vue'
 
 const themeOverrides: GlobalThemeOverrides = {
@@ -40,7 +46,9 @@ const themeOverrides: GlobalThemeOverrides = {
 <template>
   <NConfigProvider :theme="darkTheme" :theme-overrides="themeOverrides">
     <NMessageProvider>
-      <HomeView />
+      <NDialogProvider>
+        <HomeView />
+      </NDialogProvider>
     </NMessageProvider>
   </NConfigProvider>
 </template>

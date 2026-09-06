@@ -7,6 +7,7 @@ import {
   NInput,
   NProgress,
   NTag,
+  useDialog,
   useMessage
 } from 'naive-ui'
 import axios from 'axios'
@@ -63,6 +64,7 @@ interface DownloadJob {
 const TOKEN_REFRESH_MARGIN_MS = 120_000
 
 const message = useMessage()
+const dialog = useDialog()
 const draft = ref('')
 const queue = ref<QueueItem[]>([])
 const loading = ref(false)
@@ -613,15 +615,27 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
     }
     syncDownloadFailsAfterSave(jobs, failed)
     if (!freshUrls.length) {
-      message.error(`全部需重新解析后仍失败，已加入失败重试列表（${failed.length}）`)
+      dialog?.info({
+        title: '下载结果',
+        content: `全部需重新解析后仍失败，已加入失败重试列表（${failed.length}）`,
+        positiveText: '知道了'
+      })
       return
     }
     message.info('当前浏览器不支持选文件夹，将逐个触发下载（可能需允许「多个下载」）')
     await downloadUrlsSequentially(freshUrls)
     if (failed.length) {
-      message.warning(`已触发下载 ${freshUrls.length} 个，${failed.length} 个已加入失败重试列表`)
+      dialog?.info({
+        title: '下载结果',
+        content: `已触发下载 ${freshUrls.length} 个，${failed.length} 个已加入失败重试列表`,
+        positiveText: '知道了'
+      })
     } else {
-      message.success(`已触发下载（${freshUrls.length} 个文件）`)
+      dialog?.info({
+        title: '下载结果',
+        content: `已触发下载（${freshUrls.length} 个文件）`,
+        positiveText: '知道了'
+      })
     }
     return
   }
@@ -634,7 +648,11 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
     }
     message.info('当前浏览器不支持选文件夹，将逐个触发下载（可能需允许「多个下载」）')
     await downloadUrlsSequentially(jobs.map((j) => j.url))
-    message.success(`已触发下载（${jobs.length} 个文件）`)
+    dialog?.info({
+      title: '下载结果',
+      content: `已触发下载（${jobs.length} 个文件）`,
+      positiveText: '知道了'
+    })
     return
   }
 
@@ -720,11 +738,23 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
   syncDownloadFailsAfterSave(jobs, failed)
 
   if (failed.length === 0) {
-    message.success(`已保存 ${ok} 个文件到所选文件夹`)
+    dialog?.info({
+      title: '下载结果',
+      content: `已保存 ${ok} 个文件到所选文件夹`,
+      positiveText: '知道了'
+    })
   } else if (ok === 0) {
-    message.error(`全部保存失败，已加入失败重试列表（${failed.length}）`)
+    dialog?.info({
+      title: '下载结果',
+      content: `全部保存失败，已加入失败重试列表（${failed.length}）`,
+      positiveText: '知道了'
+    })
   } else {
-    message.warning(`已保存 ${ok} 个，${failed.length} 个已加入失败重试列表`)
+    dialog?.info({
+      title: '下载结果',
+      content: `已保存 ${ok} 个，${failed.length} 个已加入失败重试列表`,
+      positiveText: '知道了'
+    })
   }
 }
 
