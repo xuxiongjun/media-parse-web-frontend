@@ -255,7 +255,7 @@ export async function writeOneUrlToDirectory(
   }
 }
 
-/** 向已选目录批量写入（不弹选目录）。 */
+/** 向已选目录批量写入（不弹选目录）。默认有限并发，避免串行过慢。 */
 export async function writeUrlsToDirectory(
   dir: FileSystemDirectoryHandle,
   urlsOrItems: Array<string | FolderSaveItem>,
@@ -265,57 +265,73 @@ export async function writeUrlsToDirectory(
     usedNames?: Set<string>
     /** 文件名序号起点，默认 0 */
     startIndex?: number
+    /** 同时写入的文件数，默认 3 */
+    concurrency?: number
   }
 ): Promise<{ ok: number; fail: number; failed: FolderSaveFailedItem[] }> {
   const items = normalizeItems(urlsOrItems)
   let ok = 0
   let fail = 0
+  let finished = 0
   const failed: FolderSaveFailedItem[] = []
   const usedNames = options?.usedNames ?? new Set<string>()
   const startIndex = options?.startIndex ?? 0
   const total = items.length
+  const concurrency = Math.max(1, options?.concurrency ?? 3)
 
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i]
-    const label = item.label?.trim() || `第 ${i + 1} 个文件（${shortUrlHint(item.url)}）`
-    options?.onProgress?.({
-      done: i,
-      total,
-      currentIndex: i + 1,
-      currentLabel: label,
-      currentName: label,
-      phase: 'start'
-    })
+  let cursor = 0
 
-    const result = await writeOneUrlToDirectory(dir, item, {
-      index: startIndex + i,
-      usedNames,
-      timeoutMs: options?.timeoutMs
-    })
-
-    if (result.ok) {
-      ok += 1
+  async function worker() {
+    while (true) {
+      const i = cursor++
+      if (i >= items.length) return
+      const item = items[i]
+      const label = item.label?.trim() || `第 ${i + 1} 个文件（${shortUrlHint(item.url)}）`
       options?.onProgress?.({
-        done: i + 1,
-        total,
-        currentIndex: i + 1,
-        currentLabel: label,
-        currentName: result.name,
-        phase: 'ok'
-      })
-    } else {
-      fail += 1
-      failed.push({ url: result.url, label: result.label, reason: result.reason })
-      options?.onProgress?.({
-        done: i + 1,
+        done: finished,
         total,
         currentIndex: i + 1,
         currentLabel: label,
         currentName: label,
-        phase: 'fail',
-        failReason: result.reason
+        phase: 'start'
       })
+
+      const result = await writeOneUrlToDirectory(dir, item, {
+        index: startIndex + i,
+        usedNames,
+        timeoutMs: options?.timeoutMs
+      })
+
+      finished += 1
+      if (result.ok) {
+        ok += 1
+        options?.onProgress?.({
+          done: finished,
+          total,
+          currentIndex: i + 1,
+          currentLabel: label,
+          currentName: result.name,
+          phase: 'ok'
+        })
+      } else {
+        fail += 1
+        failed.push({ url: result.url, label: result.label, reason: result.reason })
+        options?.onProgress?.({
+          done: finished,
+          total,
+          currentIndex: i + 1,
+          currentLabel: label,
+          currentName: label,
+          phase: 'fail',
+          failReason: result.reason
+        })
+      }
     }
+  }
+
+  const workers = Math.min(concurrency, items.length || 1)
+  if (items.length) {
+    await Promise.all(Array.from({ length: workers }, () => worker()))
   }
 
   return { ok, fail, failed }
@@ -331,6 +347,7 @@ export async function saveUrlsToPickedFolder(
   options?: {
     onProgress?: (progress: FolderSaveProgress) => void
     timeoutMs?: number
+    concurrency?: number
   }
 ): Promise<FolderSaveOutcome> {
   const picked = await pickDownloadFolder()

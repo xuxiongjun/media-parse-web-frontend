@@ -331,6 +331,10 @@ function sleep(ms: number) {
  */
 const BATCH_CONCURRENCY = 3
 const BATCH_GAP_MS = 280
+/** 批量下载并发（选文件夹写入 / 浏览器触发下载） */
+const DOWNLOAD_CONCURRENCY = 3
+/** 浏览器多文件下载触发间隔，降低「多个下载」拦截概率 */
+const DOWNLOAD_GAP_MS = 180
 const RATE_LIMIT_BACKOFF_MS = 3500
 const RATE_LIMIT_MAX_RETRY = 2
 
@@ -549,12 +553,26 @@ function copyDownloadFailedTexts() {
   copyText(texts.join('\n'), `已复制 ${texts.length} 条下载失败文案`)
 }
 
-async function downloadUrlsSequentially(urls: string[], gapMs = 450) {
-  for (let i = 0; i < urls.length; i++) {
-    downloadProxy(urls[i])
-    downloadSaveDone.value = i + 1
-    downloadSaveTotal.value = urls.length
-    if (i < urls.length - 1) await sleep(gapMs)
+async function downloadUrlsWithQueue(urls: string[], concurrency = DOWNLOAD_CONCURRENCY, gapMs = DOWNLOAD_GAP_MS) {
+  downloadSaveTotal.value = urls.length
+  downloadSaveDone.value = 0
+  let cursor = 0
+  let finished = 0
+
+  async function worker() {
+    while (true) {
+      const i = cursor++
+      if (i >= urls.length) return
+      downloadProxy(urls[i])
+      finished += 1
+      downloadSaveDone.value = finished
+      if (cursor < urls.length) await sleep(gapMs)
+    }
+  }
+
+  const workers = Math.min(concurrency, urls.length)
+  if (workers > 0) {
+    await Promise.all(Array.from({ length: workers }, () => worker()))
   }
 }
 
@@ -609,6 +627,23 @@ async function ensureFreshForDownload(item: QueueItem, force = false): Promise<b
   return item.status === 'done' && !!item.result
 }
 
+/** 同一条目的并发下载共享一次重解析，避免图集多图同时 404 时重复打解析接口 */
+function createRefreshCoordinator() {
+  const inflight = new Map<string, Promise<boolean>>()
+  return (item: QueueItem, force = false) => {
+    if (!force && !isTokenStale(item.result)) {
+      return Promise.resolve(item.status === 'done' && !!item.result)
+    }
+    const existing = inflight.get(item.id)
+    if (existing) return existing
+    const task = ensureFreshForDownload(item, force).finally(() => {
+      inflight.delete(item.id)
+    })
+    inflight.set(item.id, task)
+    return task
+  }
+}
+
 function findQueueItemForJob(job: DownloadJob): QueueItem | undefined {
   if (job.itemId) return queue.value.find((i) => i.id === job.itemId)
   const raw = job.raw?.trim()
@@ -616,9 +651,15 @@ function findQueueItemForJob(job: DownloadJob): QueueItem | undefined {
   return undefined
 }
 
+type DownloadWork = {
+  originalJob: DownloadJob
+  job: DownloadJob
+  item?: QueueItem
+}
+
 /**
- * 按队列条目边刷新边下载：选文件夹一次，每条临近过期先重解析；
- * 遇到 404/过期再自动重解析并重试该文件一次。
+ * 按队列条目边刷新边下载：选文件夹一次，临近过期先批量重解析；
+ * 文件写入有限并发；遇到 404/过期再自动重解析并重试该文件一次。
  */
 async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
   if (!jobs.length) return
@@ -628,30 +669,52 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
   downloadSaveLabel.value = ''
   downloadSaveFailHint.value = ''
 
-  if (!canUseDirectoryPicker()) {
-    // 降级：先按条目刷新，再触发浏览器下载
-    const freshUrls: string[] = []
+  const groups = groupJobsByItem(jobs)
+  const refreshShared = createRefreshCoordinator()
+
+  /** 预刷新临近过期条目，再展开最终下载任务 */
+  async function prepareWorkList(): Promise<{ work: DownloadWork[]; failed: DownloadFailItem[] }> {
     const failed: DownloadFailItem[] = []
-    const groups = groupJobsByItem(jobs)
+    const staleItems = groups
+      .map((g) => g.item)
+      .filter((item): item is QueueItem => !!item && isTokenStale(item.result))
+
+    if (staleItems.length) {
+      downloadSaveLabel.value = `下载前刷新即将过期的链接（${staleItems.length}）`
+      let cursor = 0
+      async function refreshWorker() {
+        while (true) {
+          const i = cursor++
+          if (i >= staleItems.length) return
+          await refreshShared(staleItems[i], true)
+        }
+      }
+      const n = Math.min(BATCH_CONCURRENCY, staleItems.length)
+      await Promise.all(Array.from({ length: n }, () => refreshWorker()))
+    }
+
+    const work: DownloadWork[] = []
     for (const group of groups) {
       const item = group.item
-      if (item) {
-        const ok = await ensureFreshForDownload(item)
-        if (!ok) {
-          for (const job of group.jobs) {
-            failed.push(toFailItem(job, item.error || '重新解析失败'))
-          }
-          continue
-        }
+      if (item && (item.status !== 'done' || !item.result)) {
         for (const job of group.jobs) {
-          const mapped = resolveJobAfterRefresh(item, job) || job
-          freshUrls.push(mapped.url)
+          failed.push(toFailItem(job, item.error || '重新解析失败'))
         }
-      } else {
-        for (const job of group.jobs) freshUrls.push(job.url)
+        continue
+      }
+
+      for (const originalJob of group.jobs) {
+        const mapped = item ? resolveJobAfterRefresh(item, originalJob) || originalJob : originalJob
+        work.push({ originalJob, job: mapped, item })
       }
     }
+    return { work, failed }
+  }
+
+  if (!canUseDirectoryPicker()) {
+    const { work, failed } = await prepareWorkList()
     syncDownloadFailsAfterSave(jobs, failed)
+    const freshUrls = work.map((w) => w.job.url)
     if (!freshUrls.length) {
       dialog?.info({
         title: '下载结果',
@@ -660,8 +723,8 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
       })
       return
     }
-    message.info('当前浏览器不支持选文件夹，将逐个触发下载（可能需允许「多个下载」）')
-    await downloadUrlsSequentially(freshUrls)
+    message.info('当前浏览器不支持选文件夹，将队列批量触发下载（可能需允许「多个下载」）')
+    await downloadUrlsWithQueue(freshUrls)
     if (failed.length) {
       dialog?.info({
         title: '下载结果',
@@ -684,8 +747,8 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
       message.info('已取消选择文件夹')
       return
     }
-    message.info('当前浏览器不支持选文件夹，将逐个触发下载（可能需允许「多个下载」）')
-    await downloadUrlsSequentially(jobs.map((j) => j.url))
+    message.info('当前浏览器不支持选文件夹，将队列批量触发下载（可能需允许「多个下载」）')
+    await downloadUrlsWithQueue(jobs.map((j) => j.url))
     dialog?.info({
       title: '下载结果',
       content: `已触发下载（${jobs.length} 个文件）`,
@@ -694,75 +757,61 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
     return
   }
 
+  const { work, failed: prepFailed } = await prepareWorkList()
   const dir = picked.dir
   const usedNames = new Set<string>()
-  const failed: DownloadFailItem[] = []
+  const failed: DownloadFailItem[] = [...prepFailed]
   let ok = 0
-  let fileIndex = 0
-  const groups = groupJobsByItem(jobs)
+  let finished = prepFailed.length
+  downloadSaveDone.value = finished
 
-  for (const group of groups) {
-    const item = group.item
-    let refreshedThisItem = false
+  if (!work.length) {
+    syncDownloadFailsAfterSave(jobs, failed)
+    dialog?.info({
+      title: '下载结果',
+      content: `全部保存失败，已加入失败重试列表（${failed.length}）`,
+      positiveText: '知道了'
+    })
+    return
+  }
 
-    if (item) {
-      const needRefresh = isTokenStale(item.result)
-      if (needRefresh) {
-        downloadSaveLabel.value = `重新解析后下载：${shortUrl(item.raw)}`
-        const fresh = await ensureFreshForDownload(item, true)
-        refreshedThisItem = true
-        if (!fresh) {
-          for (const job of group.jobs) {
-            failed.push(toFailItem(job, item.error || '重新解析失败'))
-            fileIndex += 1
-            downloadSaveDone.value = Math.min(fileIndex, downloadSaveTotal.value)
-          }
-          continue
-        }
-      }
-    }
-
-    for (const originalJob of group.jobs) {
-      let job =
-        item && refreshedThisItem
-          ? resolveJobAfterRefresh(item, originalJob) || originalJob
-          : originalJob
+  let cursor = 0
+  async function downloadWorker() {
+    while (true) {
+      const i = cursor++
+      if (i >= work.length) return
+      const entry = work[i]
+      let job = entry.job
+      const item = entry.item
 
       downloadSaveLabel.value = job.label
       downloadSaveFailHint.value = ''
-      fileIndex += 1
-      downloadSaveDone.value = Math.min(fileIndex - 1, downloadSaveTotal.value)
 
       let result = await writeOneUrlToDirectory(
         dir,
         { url: mediaDownloadUrl(job.url), label: job.label },
-        { index: fileIndex - 1, usedNames }
+        { index: i, usedNames }
       )
 
-      if (
-        !result.ok &&
-        item &&
-        isExpiredDownloadReason(result.reason) &&
-        !refreshedThisItem
-      ) {
+      if (!result.ok && item && isExpiredDownloadReason(result.reason)) {
         downloadSaveFailHint.value = `链接过期，正在重新解析：${shortUrl(item.raw)}`
-        const fresh = await ensureFreshForDownload(item, true)
-        refreshedThisItem = true
+        const fresh = await refreshShared(item, true)
         if (fresh) {
-          const mapped = resolveJobAfterRefresh(item, originalJob)
+          const mapped = resolveJobAfterRefresh(item, entry.originalJob)
           if (mapped) {
             job = mapped
             downloadSaveLabel.value = job.label
             result = await writeOneUrlToDirectory(
               dir,
               { url: mediaDownloadUrl(job.url), label: job.label },
-              { index: fileIndex - 1, usedNames }
+              { index: i, usedNames }
             )
           }
         }
       }
 
-      downloadSaveDone.value = Math.min(fileIndex, downloadSaveTotal.value)
+      finished += 1
+      downloadSaveDone.value = Math.min(finished, downloadSaveTotal.value)
 
       if (result.ok) {
         ok += 1
@@ -772,6 +821,9 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
       }
     }
   }
+
+  const workers = Math.min(DOWNLOAD_CONCURRENCY, work.length)
+  await Promise.all(Array.from({ length: workers }, () => downloadWorker()))
 
   syncDownloadFailsAfterSave(jobs, failed)
 
