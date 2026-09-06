@@ -60,8 +60,8 @@ interface DownloadJob {
   imageIndex?: number
 }
 
-/** 代理 token 剩余不足此时长则先重新解析，避免大批量下载中途 404 */
-const TOKEN_REFRESH_MARGIN_MS = 120_000
+/** 与后端 app.media-token-ttl-seconds（3600 / 1 小时）对齐：剩余不足此时长则先重新解析 */
+const TOKEN_REFRESH_MARGIN_MS = 3_600_000
 
 const message = useMessage()
 const dialog = useDialog()
@@ -307,8 +307,12 @@ function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
-/** 批量解析间隔：避免触发本后端限流，并减轻上游平台压力 */
-const BATCH_GAP_MS = 550
+/**
+ * 批量解析：有限并发 + 启动间隔。
+ * 并发可显著缩短总耗时；间隔用于避免瞬间打满本后端 IP 限流（默认 120/分钟）。
+ */
+const BATCH_CONCURRENCY = 3
+const BATCH_GAP_MS = 280
 const RATE_LIMIT_BACKOFF_MS = 3500
 const RATE_LIMIT_MAX_RETRY = 2
 
@@ -357,6 +361,26 @@ async function parseOne(item: QueueItem) {
   }
 }
 
+/** 有限并发跑队列：同时最多 BATCH_CONCURRENCY 条，取下一项前稍作间隔 */
+async function runParsePool(targets: QueueItem[]) {
+  let cursor = 0
+  let finished = 0
+
+  async function worker() {
+    while (true) {
+      const i = cursor++
+      if (i >= targets.length) return
+      await parseOne(targets[i])
+      finished += 1
+      progressDone.value = finished
+      if (cursor < targets.length) await sleep(BATCH_GAP_MS)
+    }
+  }
+
+  const workers = Math.min(BATCH_CONCURRENCY, targets.length)
+  await Promise.all(Array.from({ length: workers }, () => worker()))
+}
+
 async function onBatchParse() {
   if (loading.value) return
 
@@ -389,11 +413,7 @@ async function onBatchParse() {
   }
 
   try {
-    for (let i = 0; i < targets.length; i++) {
-      await parseOne(targets[i])
-      progressDone.value = i + 1
-      if (i < targets.length - 1) await sleep(BATCH_GAP_MS)
-    }
+    await runParsePool(targets)
     await nextTick()
     const ok = successCount.value
     const bad = failCount.value
@@ -1018,11 +1038,7 @@ async function retryFailed() {
   progressTotal.value = targets.length
 
   try {
-    for (let i = 0; i < targets.length; i++) {
-      await parseOne(targets[i])
-      progressDone.value = i + 1
-      if (i < targets.length - 1) await sleep(BATCH_GAP_MS)
-    }
+    await runParsePool(targets)
     await nextTick()
     const stillFail = targets.filter((i) => i.status === 'error').length
     const recovered = targets.length - stillFail
