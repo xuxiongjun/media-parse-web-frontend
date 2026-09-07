@@ -45,8 +45,11 @@ export type WriteOneResult =
   | { ok: true; name: string; label: string }
   | { ok: false; url: string; label: string; reason: string }
 
-/** 单文件拉取+写入上限；超时则跳过，保证整批能跑完 */
-const DOWNLOAD_TIMEOUT_MS = 90_000
+/**
+ * 传输空闲超时：只要持续收到数据就不限制总时长。
+ * 避免大文件 / 慢网在固定 90s 硬超时下被掐断，留下打不开的半截文件。
+ */
+const DOWNLOAD_IDLE_TIMEOUT_MS = 120_000
 
 type DirectoryPickerWindow = Window & {
   showDirectoryPicker?: (options?: {
@@ -208,28 +211,51 @@ function yieldToUi(): Promise<void> {
   })
 }
 
-function createTimeout(ms: number): { signal: AbortSignal; clear: () => void } {
+/** 空闲超时：有数据时 ping 重置；长时间无字节才 abort */
+function createIdleTimeout(ms: number): {
+  signal: AbortSignal
+  ping: () => void
+  clear: () => void
+} {
   const controller = new AbortController()
-  const id = window.setTimeout(() => {
-    controller.abort(new DOMException(`下载超时（${Math.round(ms / 1000)}s）`, 'TimeoutError'))
-  }, ms)
+  let id: number | undefined
+  const arm = () => {
+    if (id !== undefined) window.clearTimeout(id)
+    id = window.setTimeout(() => {
+      controller.abort(
+        new DOMException(
+          `下载中断：超过 ${Math.round(ms / 1000)}s 未收到数据`,
+          'TimeoutError'
+        )
+      )
+    }, ms)
+  }
+  arm()
   return {
     signal: controller.signal,
-    clear: () => window.clearTimeout(id)
+    ping: arm,
+    clear: () => {
+      if (id !== undefined) window.clearTimeout(id)
+    }
   }
 }
 
 function failReason(err: unknown): string {
   if (err instanceof DOMException) {
     if (err.name === 'AbortError' || err.name === 'TimeoutError') {
-      return err.message || '下载超时，已跳过'
+      return err.message || '下载中断，已跳过（未保存不完整文件）'
     }
     if (err.name === 'NotAllowedError') {
       return '浏览器未授权写入所选文件夹，请重新选择文件夹并允许访问'
     }
   }
   if (err instanceof Error) {
-    if (/aborted|timeout|超时/i.test(err.message)) return '下载超时，已跳过'
+    if (/下载不完整/i.test(err.message)) return err.message
+    if (/aborted|timeout|超时|中断/i.test(err.message)) {
+      return err.message.includes('未收到数据')
+        ? err.message
+        : '下载中断，已跳过（未保存不完整文件）'
+    }
     if (/name is not allowed/i.test(err.message)) {
       return '文件名不合法，已无法保存（可重试下载）'
     }
@@ -239,6 +265,19 @@ function failReason(err: unknown): string {
     return err.message || '下载失败'
   }
   return '下载失败'
+}
+
+async function removePartialFile(
+  dir: FileSystemDirectoryHandle,
+  name: string,
+  usedNames: Set<string>
+): Promise<void> {
+  usedNames.delete(name.toLowerCase())
+  try {
+    await dir.removeEntry(name)
+  } catch {
+    /* 文件可能尚未创建或已被 abort 清理 */
+  }
 }
 
 function shortUrlHint(url: string): string {
@@ -256,9 +295,9 @@ async function writeUrlToDirectory(
   url: string,
   index: number,
   usedNames: Set<string>,
-  signal: AbortSignal
+  idle: { signal: AbortSignal; ping: () => void }
 ): Promise<string> {
-  const response = await fetch(url, { signal })
+  const response = await fetch(url, { signal: idle.signal })
   if (!response.ok) {
     throw new Error(`下载失败（HTTP ${response.status}）`)
   }
@@ -279,6 +318,7 @@ async function writeUrlToDirectory(
   try {
     writable = await fileHandle.createWritable()
   } catch (err) {
+    await removePartialFile(dir, name, usedNames)
     if (
       (err instanceof DOMException && err.name === 'NotAllowedError') ||
       (err instanceof Error && /not allowed by the user agent/i.test(err.message))
@@ -291,14 +331,40 @@ async function writeUrlToDirectory(
     throw err
   }
 
+  const expectedLen = Number(response.headers.get('Content-Length') || '') || 0
+
   try {
+    let received = 0
     if (response.body) {
-      await response.body.pipeTo(writable, { signal })
+      const reader = response.body.getReader()
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          idle.ping()
+          received += value.byteLength
+          await writable.write(value)
+        }
+      } catch (err) {
+        try {
+          await reader.cancel()
+        } catch {
+          /* ignore */
+        }
+        throw err
+      }
+      await writable.close()
     } else {
       const buffer = await response.arrayBuffer()
-      signal.throwIfAborted()
+      idle.signal.throwIfAborted()
+      idle.ping()
+      received = buffer.byteLength
       await writable.write(buffer)
       await writable.close()
+    }
+
+    if (expectedLen > 0 && received !== expectedLen) {
+      throw new Error(`下载不完整（已收 ${received} / 预期 ${expectedLen} 字节），未保存`)
     }
   } catch (err) {
     try {
@@ -306,6 +372,7 @@ async function writeUrlToDirectory(
     } catch {
       /* ignore */
     }
+    await removePartialFile(dir, name, usedNames)
     throw err
   }
 
@@ -342,6 +409,7 @@ export async function pickDownloadFolder(): Promise<PickFolderResult> {
 /**
  * 将单个 URL 写入已选目录。
  * usedNames 可跨多次调用共享，避免文件名冲突。
+ * timeoutMs 表示「无数据空闲超时」，有传输进度时不限制总时长。
  */
 export async function writeOneUrlToDirectory(
   dir: FileSystemDirectoryHandle,
@@ -349,21 +417,22 @@ export async function writeOneUrlToDirectory(
   options?: {
     index?: number
     usedNames?: Set<string>
+    /** 无数据空闲超时（ms），默认 120s；持续有数据则不限总时长 */
     timeoutMs?: number
   }
 ): Promise<WriteOneResult> {
   const index = options?.index ?? 0
   const usedNames = options?.usedNames ?? new Set<string>()
-  const timeoutMs = options?.timeoutMs ?? DOWNLOAD_TIMEOUT_MS
+  const timeoutMs = options?.timeoutMs ?? DOWNLOAD_IDLE_TIMEOUT_MS
   const label = item.label?.trim() || `第 ${index + 1} 个文件（${shortUrlHint(item.url)}）`
-  const timeout = createTimeout(timeoutMs)
+  const idle = createIdleTimeout(timeoutMs)
   try {
-    const name = await writeUrlToDirectory(dir, item.url, index, usedNames, timeout.signal)
+    const name = await writeUrlToDirectory(dir, item.url, index, usedNames, idle)
     return { ok: true, name, label }
   } catch (err) {
     return { ok: false, url: item.url, label, reason: failReason(err) }
   } finally {
-    timeout.clear()
+    idle.clear()
     await yieldToUi()
   }
 }
@@ -374,6 +443,7 @@ export async function writeUrlsToDirectory(
   urlsOrItems: Array<string | FolderSaveItem>,
   options?: {
     onProgress?: (progress: FolderSaveProgress) => void
+    /** 无数据空闲超时（ms）；持续有数据则不限总时长 */
     timeoutMs?: number
     usedNames?: Set<string>
     /** 文件名序号起点，默认 0 */
@@ -452,7 +522,7 @@ export async function writeUrlsToDirectory(
 
 /**
  * 在用户点击手势内调用：弹出选目录，再逐个 fetch 写入。
- * 单文件超时会跳过并继续，整批一定会结束。
+ * 单文件长时间无数据会跳过并清理半截文件，整批一定会结束。
  * 不支持 API 时返回 unsupported，由调用方降级。
  */
 export async function saveUrlsToPickedFolder(
