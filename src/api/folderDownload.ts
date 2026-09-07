@@ -39,6 +39,7 @@ export type PickFolderResult =
   | { ok: true; dir: FileSystemDirectoryHandle }
   | { ok: false; cancelled: true }
   | { ok: false; unsupported: true }
+  | { ok: false; denied: true }
 
 export type WriteOneResult =
   | { ok: true; name: string; label: string }
@@ -68,12 +69,35 @@ export function isExpiredDownloadReason(reason: string): boolean {
   return /HTTP\s*404|过期|不存在|NOT_FOUND|资源无效/i.test(reason)
 }
 
-function sanitizeFilename(name: string): string {
-  const cleaned = name
-    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+/** Windows / Chromium File System Access 会拒绝的保留名 */
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i
+
+/**
+ * 生成 File System Access API 可接受的文件名。
+ * Chromium 会拒绝：空名、`.`/`..`、含 / \、控制字符、尾随 `.`/空格、部分 Windows 保留名。
+ */
+function sanitizeFilename(name: string, fallback = 'download.bin'): string {
+  let cleaned = name
+    .normalize('NFKC')
+    .replace(/[<>:"/\\|?*\u0000-\u001f\u007f]/g, '_')
+    .replace(/[\u200b-\u200f\u2028\u2029\ufeff]/g, '')
     .replace(/\s+/g, ' ')
     .trim()
-  return cleaned || 'download.bin'
+
+  // 去掉尾随点/空格（Windows 组件名不允许）
+  cleaned = cleaned.replace(/[.\s]+$/g, '')
+
+  if (!cleaned || cleaned === '.' || cleaned === '..') return fallback
+  if (WINDOWS_RESERVED.test(cleaned)) cleaned = `_${cleaned}`
+
+  // 路径组件过长时截断，尽量保留扩展名
+  if (cleaned.length > 120) {
+    const { stem, ext } = splitName(cleaned)
+    const maxStem = Math.max(8, 120 - ext.length)
+    cleaned = `${stem.slice(0, maxStem).replace(/[.\s]+$/g, '') || 'download'}${ext}`
+  }
+
+  return cleaned || fallback
 }
 
 function parseFilenameFromDisposition(header: string | null): string | null {
@@ -81,13 +105,18 @@ function parseFilenameFromDisposition(header: string | null): string | null {
   const utf8 = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(header)
   if (utf8?.[1]) {
     try {
-      return sanitizeFilename(decodeURIComponent(utf8[1].trim().replace(/^["']|["']$/g, '')))
+      const decoded = decodeURIComponent(utf8[1].trim().replace(/^["']|["']$/g, ''))
+      const safe = sanitizeFilename(decoded)
+      return safe === 'download.bin' && !decoded.trim() ? null : safe
     } catch {
       /* ignore */
     }
   }
   const plain = /filename\s*=\s*("?)([^";]+)\1/i.exec(header)
-  if (plain?.[2]) return sanitizeFilename(plain[2].trim())
+  if (plain?.[2]) {
+    const safe = sanitizeFilename(plain[2].trim())
+    return safe === 'download.bin' && !plain[2].trim() ? null : safe
+  }
   return null
 }
 
@@ -114,17 +143,62 @@ function splitName(filename: string): { stem: string; ext: string } {
 }
 
 /** 用内存集合去重，避免对目录反复 getFileHandle 探测导致卡顿 */
-function nextUniqueFilename(used: Set<string>, preferred: string): string {
-  const base = sanitizeFilename(preferred)
+function nextUniqueFilename(used: Set<string>, preferred: string, fallback?: string): string {
+  const base = sanitizeFilename(preferred, fallback || 'download.bin')
   const { stem, ext } = splitName(base)
-  let candidate = base
+  const safeStem = sanitizeFilename(stem, 'download') || 'download'
+  let candidate = sanitizeFilename(`${safeStem}${ext}`, fallback || 'download.bin')
   let n = 1
   while (used.has(candidate.toLowerCase())) {
-    candidate = `${stem} (${n})${ext}`
+    candidate = sanitizeFilename(`${safeStem} (${n})${ext}`, `download-${n}${ext || '.bin'}`)
     n += 1
   }
   used.add(candidate.toLowerCase())
   return candidate
+}
+
+function isInvalidFilenameError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return /name is not allowed/i.test(msg)
+}
+
+async function getWritableFileHandle(
+  dir: FileSystemDirectoryHandle,
+  filename: string,
+  usedNames: Set<string>,
+  index: number,
+  contentType: string | null
+): Promise<{ fileHandle: FileSystemFileHandle; name: string }> {
+  try {
+    const fileHandle = await dir.getFileHandle(filename, { create: true })
+    return { fileHandle, name: filename }
+  } catch (err) {
+    if (!isInvalidFilenameError(err)) throw err
+    // 标题派生名被浏览器拒绝时，回退到安全序号名并重试一次
+    usedNames.delete(filename.toLowerCase())
+    const safeName = nextUniqueFilename(usedNames, fallbackFilename(index, contentType))
+    const fileHandle = await dir.getFileHandle(safeName, { create: true })
+    return { fileHandle, name: safeName }
+  }
+}
+
+/** 在用户手势内确认目录可写；选目录后、长耗时任务前调用。 */
+export async function ensureDirectoryWritable(dir: FileSystemDirectoryHandle): Promise<boolean> {
+  const opts = { mode: 'readwrite' as const }
+  try {
+    if (typeof dir.queryPermission === 'function') {
+      const state = await dir.queryPermission(opts)
+      if (state === 'granted') return true
+    }
+    if (typeof dir.requestPermission === 'function') {
+      const state = await dir.requestPermission(opts)
+      return state === 'granted'
+    }
+    // 旧实现无 permission API 时，假定选目录即已授权
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** 让出主线程，保证进度条与点击可响应 */
@@ -150,9 +224,18 @@ function failReason(err: unknown): string {
     if (err.name === 'AbortError' || err.name === 'TimeoutError') {
       return err.message || '下载超时，已跳过'
     }
+    if (err.name === 'NotAllowedError') {
+      return '浏览器未授权写入所选文件夹，请重新选择文件夹并允许访问'
+    }
   }
   if (err instanceof Error) {
     if (/aborted|timeout|超时/i.test(err.message)) return '下载超时，已跳过'
+    if (/name is not allowed/i.test(err.message)) {
+      return '文件名不合法，已无法保存（可重试下载）'
+    }
+    if (/not allowed by the user agent|NotAllowedError/i.test(err.message)) {
+      return '浏览器未授权写入所选文件夹，请重新选择文件夹并允许访问'
+    }
     return err.message || '下载失败'
   }
   return '下载失败'
@@ -180,11 +263,33 @@ async function writeUrlToDirectory(
     throw new Error(`下载失败（HTTP ${response.status}）`)
   }
 
+  const contentType = response.headers.get('Content-Type')
   const fromHeader = parseFilenameFromDisposition(response.headers.get('Content-Disposition'))
-  const preferred = fromHeader || fallbackFilename(index, response.headers.get('Content-Type'))
-  const filename = nextUniqueFilename(usedNames, preferred)
-  const fileHandle = await dir.getFileHandle(filename, { create: true })
-  const writable = await fileHandle.createWritable()
+  const preferred = fromHeader || fallbackFilename(index, contentType)
+  const filename = nextUniqueFilename(usedNames, preferred, fallbackFilename(index, contentType))
+  const { fileHandle, name } = await getWritableFileHandle(
+    dir,
+    filename,
+    usedNames,
+    index,
+    contentType
+  )
+
+  let writable: FileSystemWritableFileStream
+  try {
+    writable = await fileHandle.createWritable()
+  } catch (err) {
+    if (
+      (err instanceof DOMException && err.name === 'NotAllowedError') ||
+      (err instanceof Error && /not allowed by the user agent/i.test(err.message))
+    ) {
+      throw new DOMException(
+        '浏览器未授权写入所选文件夹，请重新选择文件夹并允许访问',
+        'NotAllowedError'
+      )
+    }
+    throw err
+  }
 
   try {
     if (response.body) {
@@ -204,23 +309,31 @@ async function writeUrlToDirectory(
     throw err
   }
 
-  return filename
+  return name
 }
 
 function normalizeItems(urlsOrItems: Array<string | FolderSaveItem>): FolderSaveItem[] {
   return urlsOrItems.map((item) => (typeof item === 'string' ? { url: item } : item))
 }
 
-/** 在用户点击手势内调用：弹出选目录。 */
+/** 在用户点击手势内调用：弹出选目录，并立即确认可写权限。 */
 export async function pickDownloadFolder(): Promise<PickFolderResult> {
   const showPicker = pickerWindow().showDirectoryPicker
   if (!showPicker) return { ok: false, unsupported: true }
   try {
     const dir = await showPicker({ id: 'media-parse-downloads', mode: 'readwrite' })
+    const writable = await ensureDirectoryWritable(dir)
+    if (!writable) return { ok: false, denied: true }
     return { ok: true, dir }
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') {
       return { ok: false, cancelled: true }
+    }
+    if (
+      (err instanceof DOMException && err.name === 'NotAllowedError') ||
+      (err instanceof Error && /not allowed by the user agent/i.test(err.message))
+    ) {
+      return { ok: false, denied: true }
     }
     throw err
   }

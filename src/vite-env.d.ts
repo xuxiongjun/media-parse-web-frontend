@@ -33,11 +33,17 @@ interface WriteParams {
   size?: number
 }
 
+interface FileSystemHandlePermissionDescriptor {
+  mode?: 'read' | 'readwrite'
+}
+
 interface FileSystemFileHandle {
   kind: 'file'
   name: string
   getFile(): Promise<File>
   createWritable(options?: FileSystemCreateWritableOptions): Promise<FileSystemWritableFileStream>
+  queryPermission?(descriptor?: FileSystemHandlePermissionDescriptor): Promise<PermissionState>
+  requestPermission?(descriptor?: FileSystemHandlePermissionDescriptor): Promise<PermissionState>
 }
 
 interface FileSystemDirectoryHandle {
@@ -45,5 +51,6 @@ interface FileSystemDirectoryHandle {
   name: string
   getFileHandle(name: string, options?: { create?: boolean }): Promise<FileSystemFileHandle>
   getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<FileSystemDirectoryHandle>
-  requestPermission?(options?: { mode?: 'read' | 'readwrite' }): Promise<PermissionState>
+  queryPermission?(descriptor?: FileSystemHandlePermissionDescriptor): Promise<PermissionState>
+  requestPermission?(descriptor?: FileSystemHandlePermissionDescriptor): Promise<PermissionState>
 }

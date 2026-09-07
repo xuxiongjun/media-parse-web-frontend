@@ -800,6 +800,10 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
       message.info('已取消选择文件夹')
       return
     }
+    if ('denied' in picked && picked.denied) {
+      message.error('浏览器未授权写入所选文件夹，请重新选择并允许访问')
+      return
+    }
     message.info('当前浏览器不支持选文件夹，将队列批量触发下载（可能需允许「多个下载」）')
     await downloadUrlsWithQueue(jobs.map((j) => j.url))
     dialog?.info({
