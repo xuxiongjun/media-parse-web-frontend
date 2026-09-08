@@ -140,6 +140,44 @@ function isTokenStale(result: ParseResult | null | undefined): boolean {
   return result.expireAt - Date.now() < TOKEN_REFRESH_MARGIN_MS
 }
 
+function isTokenExpired(result: ParseResult | null | undefined): boolean {
+  if (!result?.expireAt) return false
+  return result.expireAt <= Date.now()
+}
+
+function markMediaExpired(itemId: string) {
+  if (mediaExpiredIds.value.has(itemId)) return
+  const next = new Set(mediaExpiredIds.value)
+  next.add(itemId)
+  mediaExpiredIds.value = next
+}
+
+function clearMediaExpired(itemId: string) {
+  if (!mediaExpiredIds.value.has(itemId)) return
+  const next = new Set(mediaExpiredIds.value)
+  next.delete(itemId)
+  mediaExpiredIds.value = next
+}
+
+function isMediaUnavailable(item: QueueItem): boolean {
+  return mediaExpiredIds.value.has(item.id) || isTokenExpired(item.result)
+}
+
+/** 代理失效时卸掉 src，否则原生 video 会对 404 持续 Range/重试 */
+function onVideoMediaError(item: QueueItem, event: Event) {
+  const el = event.target as HTMLVideoElement
+  el.removeAttribute('src')
+  el.removeAttribute('poster')
+  try {
+    el.load()
+  } catch {
+    /* ignore */
+  }
+  const first = !mediaExpiredIds.value.has(item.id)
+  markMediaExpired(item.id)
+  if (first) message.warning('代理链接已失效，请重新解析后再播放')
+}
+
 function resolveJobAfterRefresh(item: QueueItem, job: DownloadJob): DownloadJob | null {
   const index = queue.value.findIndex((q) => q.id === item.id)
   const freshJobs = jobsFromQueueItem(item, index >= 0 ? index : 0)
@@ -175,6 +213,8 @@ const downloadableCount = computed(() => collectDownloadUrls().length)
 const downloadFailCount = computed(() => downloadFailList.value.length)
 const highlightId = ref<string | null>(null)
 let highlightTimer: number | undefined
+/** 媒体代理加载失败（多为 token 过期），用于卸掉 video src 并停止浏览器重试 */
+const mediaExpiredIds = ref<Set<string>>(new Set())
 
 /** 超过上限时截取前 MAX_QUEUE 条，并提示未写入数量 */
 function takeEntriesWithCap(entries: string[]): string[] {
@@ -401,6 +441,7 @@ async function parseOne(item: QueueItem) {
     try {
       item.result = await parseShareUrl(raw)
       item.status = 'done'
+      clearMediaExpired(item.id)
       return
     } catch (err) {
       if (isRateLimited(err) && attempt < RATE_LIMIT_MAX_RETRY) {
@@ -411,6 +452,7 @@ async function parseOne(item: QueueItem) {
       item.result = null
       item.status = 'error'
       item.error = errMessage(err)
+      clearMediaExpired(item.id)
       return
     }
   }
@@ -545,8 +587,13 @@ function downloadProxy(proxyUrl: string, filename?: string) {
   triggerBrowserDownload(mediaDownloadUrl(proxyUrl), filename)
 }
 
-function onDownloadVideo(result: ParseResult) {
-  if (!result.videoProxyUrl) return
+function onDownloadVideo(item: QueueItem) {
+  const result = item.result
+  if (!result?.videoProxyUrl) return
+  if (isMediaUnavailable(item)) {
+    message.warning('代理链接已失效，请先重新解析')
+    return
+  }
   downloadProxy(result.videoProxyUrl)
   message.success('已开始下载视频')
 }
@@ -1528,12 +1575,22 @@ async function retryFailed() {
             <template v-else-if="item.result">
               <div class="result">
                 <div class="result-media">
+                  <div v-if="isMediaUnavailable(item)" class="player player-expired">
+                    <p class="player-expired-title">代理链接已失效</p>
+                    <p class="player-expired-desc">请重新解析后再播放</p>
+                    <NButton type="primary" :disabled="loading" @click="retryOne(item)">
+                      重新解析
+                    </NButton>
+                  </div>
                   <video
+                    v-else
                     class="player"
                     controls
                     playsinline
+                    :key="item.result.videoProxyUrl"
                     :poster="item.result.coverProxyUrl || undefined"
                     :src="item.result.videoProxyUrl"
+                    @error="onVideoMediaError(item, $event)"
                   />
                 </div>
                 <div class="result-meta">
@@ -1545,10 +1602,26 @@ async function retryFailed() {
                   </div>
                   <h2 class="title">{{ item.result.title || '未命名视频' }}</h2>
                   <p v-if="item.result.author" class="author">作者：{{ item.result.author }}</p>
-                  <NButton type="primary" size="large" block @click="onDownloadVideo(item.result)">
+                  <NButton
+                    v-if="isMediaUnavailable(item)"
+                    type="warning"
+                    size="large"
+                    block
+                    :disabled="loading"
+                    @click="retryOne(item)"
+                  >
+                    重新解析后下载
+                  </NButton>
+                  <NButton v-else type="primary" size="large" block @click="onDownloadVideo(item)">
                     下载无水印视频
                   </NButton>
-                  <p class="hint">代理链接短时有效，过期请重新解析。</p>
+                  <p class="hint">
+                    {{
+                      isMediaUnavailable(item)
+                        ? '代理链接已过期，请重新解析。'
+                        : '代理链接短时有效，过期请重新解析。'
+                    }}
+                  </p>
                 </div>
               </div>
             </template>
@@ -1979,6 +2052,30 @@ async function retryFailed() {
   object-fit: contain;
   background: #000;
   border-radius: 14px;
+}
+
+.player-expired {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 20px;
+  box-sizing: border-box;
+  color: #f5f5f5;
+  text-align: center;
+}
+
+.player-expired-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.player-expired-desc {
+  margin: 0 0 8px;
+  font-size: 0.88rem;
+  color: rgba(245, 245, 245, 0.72);
 }
 
 .result-meta {
