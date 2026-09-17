@@ -29,7 +29,7 @@ function getWorker() {
   if (!worker) {
     worker = new Worker(new URL('./workers/imageWorker.ts', import.meta.url), {
       type: 'module',
-      name: 'watermark-image-v4-br-fix'
+      name: 'watermark-image-v6-texture'
     })
     worker.onmessage = (event: MessageEvent<ImageWorkerResponse>) => {
       const job = pending.get(event.data.id)

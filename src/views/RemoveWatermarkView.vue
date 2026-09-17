@@ -407,7 +407,7 @@ onUnmounted(() => clearTasks())
       <header class="hero">
         <h1 class="headline">上传图片或短视频，自动识别并去除水印</h1>
         <p class="sub">
-          全部在浏览器本地处理。图片走 Web Worker；自动识别角标文字并用周围纹理修复（非纯色遮盖）。视频首次处理会懒加载 ffmpeg。一次只能选一种类型。
+          全部在浏览器本地处理。图片走 Web Worker；自动识别角标白字，并用上方路面纹理克隆修复（非纯色色块）。视频首次处理会懒加载 ffmpeg。一次只能选一种类型。
         </p>
       </header>
 
