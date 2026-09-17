@@ -1,7 +1,7 @@
 export const IMAGE_EXT = new Set(['jpg', 'jpeg', 'png', 'webp', 'bmp'])
 export const VIDEO_EXT = new Set(['mp4', 'webm', 'mov'])
-export const MAX_IMAGES = 30
-export const MAX_ZIP_BYTES = 120 * 1024 * 1024
+/** 散图上传上限；压缩包内图片不套用此限制 */
+export const MAX_IMAGES = 120
 export const MAX_IMAGE_BYTES = 20 * 1024 * 1024
 export const MAX_VIDEO_BYTES = 80 * 1024 * 1024
 

@@ -57,7 +57,7 @@ const acceptAttr = computed(() => {
 const modeHint = computed(() => {
   if (!uploadMode.value) return '一次仅选一种类型：多张图片 / 单个 zip / 单个视频'
   if (uploadMode.value === 'images') return `已选图片模式 · 最多 ${MAX_IMAGES} 张 · 单张 ≤ ${MAX_IMAGE_BYTES / 1024 / 1024}MB`
-  if (uploadMode.value === 'zip') return '已选 zip 模式 · 仅支持 1 个压缩包'
+  if (uploadMode.value === 'zip') return '已选 zip 模式 · 仅 1 个压缩包 · 内含图片数量不限制'
   return `已选视频模式 · 仅 1 个文件 · ≤ ${MAX_VIDEO_BYTES / 1024 / 1024}MB · 时长 ≤ 45 秒 · 保留原声`
 })
 
@@ -96,8 +96,9 @@ function ensureMode(file: File): UploadMode | null {
   return mode
 }
 
-function addImageTask(file: File) {
-  if (file.size > MAX_IMAGE_BYTES) {
+function addImageTask(file: File, options?: { fromZip?: boolean }) {
+  const fromZip = options?.fromZip === true
+  if (!fromZip && file.size > MAX_IMAGE_BYTES) {
     message.error(`${file.name} 超过单张大小限制`)
     return
   }
@@ -105,7 +106,7 @@ function addImageTask(file: File) {
     message.error(`${file.name} 不是支持的图片格式`)
     return
   }
-  if (tasks.value.length >= MAX_IMAGES) {
+  if (!fromZip && tasks.value.length >= MAX_IMAGES) {
     message.warning(`最多 ${MAX_IMAGES} 张图片`)
     return
   }
@@ -160,7 +161,7 @@ async function addZipTask(file: File) {
   try {
     const images = await extractImagesFromZip(file)
     uploadMode.value = 'zip'
-    for (const img of images) addImageTask(img)
+    for (const img of images) addImageTask(img, { fromZip: true })
     message.success(`已从压缩包读取 ${images.length} 张图片`)
   } catch (e) {
     message.error(e instanceof Error ? e.message : '压缩包解析失败')
