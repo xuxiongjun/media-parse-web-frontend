@@ -17,9 +17,20 @@ let worker: Worker | null = null
 let seq = 0
 const pending = new Map<string, Pending>()
 
+function resetWorker() {
+  if (worker) {
+    worker.terminate()
+    worker = null
+  }
+  pending.clear()
+}
+
 function getWorker() {
   if (!worker) {
-    worker = new Worker(new URL('./workers/imageWorker.ts', import.meta.url), { type: 'module' })
+    worker = new Worker(new URL('./workers/imageWorker.ts', import.meta.url), {
+      type: 'module',
+      name: 'watermark-image-v4-br-fix'
+    })
     worker.onmessage = (event: MessageEvent<ImageWorkerResponse>) => {
       const job = pending.get(event.data.id)
       if (!job) return
@@ -28,9 +39,7 @@ function getWorker() {
     }
     worker.onerror = (err) => {
       for (const [, job] of pending) job.reject(err)
-      pending.clear()
-      worker?.terminate()
-      worker = null
+      resetWorker()
     }
   }
   return worker
@@ -58,7 +67,9 @@ function bufferToObjectUrl(buffer: ArrayBuffer, width: number, height: number, t
   canvas.height = height
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('Canvas 不可用')
-  ctx.putImageData(new ImageData(new Uint8ClampedArray(buffer), width, height), 0, 0)
+  // 必须用精确长度的视图，避免 buffer 带多余字节
+  const pixels = new Uint8ClampedArray(buffer, 0, width * height * 4)
+  ctx.putImageData(new ImageData(pixels.slice(), width, height), 0, 0)
   return new Promise<{ blob: Blob; url: string }>((resolve, reject) => {
     canvas.toBlob((b) => {
       if (!b) {
@@ -73,7 +84,9 @@ function bufferToObjectUrl(buffer: ArrayBuffer, width: number, height: number, t
 function runInWorker(imageData: ImageData): Promise<ImageWorkerResponse> {
   const id = `img-${++seq}`
   const w = getWorker()
-  const buffer = imageData.data.buffer.slice(0)
+  // 精确拷贝像素，避免 ImageData.buffer 偏移/多余长度导致 Worker 处理错图
+  const pixels = new Uint8ClampedArray(imageData.data)
+  const buffer = pixels.buffer
   const request: ImageWorkerRequest = {
     id,
     width: imageData.width,
@@ -87,13 +100,16 @@ function runInWorker(imageData: ImageData): Promise<ImageWorkerResponse> {
   })
 }
 
-/** 主线程只解码图片，检测与修复在 Worker 中执行，避免 UI 卡顿 */
+/** 主线程解码，Worker 检测+邻色回填 */
 export async function processImageFile(file: File): Promise<ProcessImageResult> {
+  // 每次处理前重建 Worker，避免开发态旧脚本缓存
+  resetWorker()
+
   const img = await loadImageFromFile(file)
   const canvas = document.createElement('canvas')
   canvas.width = img.naturalWidth
   canvas.height = img.naturalHeight
-  const ctx = canvas.getContext('2d')
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
   if (!ctx) throw new Error('Canvas 不可用')
   ctx.drawImage(img, 0, 0)
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)

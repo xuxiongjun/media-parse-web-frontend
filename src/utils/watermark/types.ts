@@ -13,6 +13,7 @@ export interface WatermarkTask {
   resultUrl: string | null
   resultBlob: Blob | null
   maskPreviewUrl: string | null
+  regionLabel: string | null
 }
 
 export interface WatermarkBox {

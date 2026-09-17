@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from 'vue'
-import { NButton, NProgress, NTag, useMessage } from 'naive-ui'
+import { NButton, NImage, NProgress, NTag, useMessage } from 'naive-ui'
 import AppNav from '../components/AppNav.vue'
 import {
   isImageName,
@@ -107,7 +107,8 @@ function addImageTask(file: File) {
     originalUrl: URL.createObjectURL(file),
     resultUrl: null,
     resultBlob: null,
-    maskPreviewUrl: null
+    maskPreviewUrl: null,
+    regionLabel: null
   })
 }
 
@@ -134,7 +135,8 @@ function addVideoTask(file: File) {
     originalUrl: URL.createObjectURL(file),
     resultUrl: null,
     resultBlob: null,
-    maskPreviewUrl: null
+    maskPreviewUrl: null,
+    regionLabel: null
   })
 }
 
@@ -198,6 +200,7 @@ async function processOne(task: WatermarkTask) {
       task.resultBlob = result.blob
       task.resultUrl = result.previewUrl
       task.maskPreviewUrl = result.maskPreviewUrl
+      task.regionLabel = result.regionLabel
       task.status = 'done'
       fileProgress.value = 100
     } else {
@@ -210,6 +213,7 @@ async function processOne(task: WatermarkTask) {
       task.resultBlob = result.blob
       task.resultUrl = result.previewUrl
       task.maskPreviewUrl = result.maskPreviewUrl
+      task.regionLabel = result.regionLabel
       task.status = 'done'
       fileProgress.value = 100
       message.success(result.note)
@@ -286,7 +290,7 @@ onUnmounted(() => clearTasks())
       <header class="hero">
         <h1 class="headline">上传图片或短视频，自动识别并去除水印</h1>
         <p class="sub">
-          全部在浏览器本地处理。图片走 Web Worker 防卡顿；视频首次处理时懒加载 ffmpeg（约 30MB，仅下一次），处理后保留原声轨。一次只能选一种类型。
+          全部在浏览器本地处理。图片走 Web Worker；自动识别角标文字并用周围纹理修复（非纯色遮盖）。视频首次处理会懒加载 ffmpeg。一次只能选一种类型。
         </p>
       </header>
 
@@ -353,23 +357,41 @@ onUnmounted(() => clearTasks())
               <p class="task-name">{{ task.name }}</p>
               <NTag size="small" :type="statusTag(task).type">{{ statusTag(task).label }}</NTag>
             </div>
+            <p v-if="task.regionLabel" class="task-meta">检测位置：{{ task.regionLabel }}</p>
 
             <p v-if="task.error" class="task-error">{{ task.error }}</p>
 
             <div v-if="task.originalUrl || task.resultUrl" class="compare-grid">
               <div v-if="task.originalUrl" class="compare-item">
-                <p class="compare-label">原图</p>
-                <img v-if="task.kind === 'image'" :src="task.originalUrl" alt="原图" class="preview" />
+                <p class="compare-label">原图（点击预览）</p>
+                <NImage
+                  v-if="task.kind === 'image'"
+                  :src="task.originalUrl"
+                  object-fit="contain"
+                  class="preview-image"
+                  :img-props="{ alt: '原图' }"
+                />
                 <video v-else :src="task.originalUrl" controls class="preview" />
               </div>
               <div v-if="task.resultUrl" class="compare-item">
-                <p class="compare-label">去水印后</p>
-                <img v-if="task.kind === 'image'" :src="task.resultUrl" alt="结果" class="preview" />
+                <p class="compare-label">去水印后（点这里看结果）</p>
+                <NImage
+                  v-if="task.kind === 'image'"
+                  :src="task.resultUrl"
+                  object-fit="contain"
+                  class="preview-image"
+                  :img-props="{ alt: '去水印后' }"
+                />
                 <video v-else :src="task.resultUrl" controls class="preview" />
               </div>
               <div v-if="task.maskPreviewUrl" class="compare-item">
-                <p class="compare-label">检测区域</p>
-                <img :src="task.maskPreviewUrl" alt="水印区域" class="preview" />
+                <p class="compare-label">检测区域（点击预览）</p>
+                <NImage
+                  :src="task.maskPreviewUrl"
+                  object-fit="contain"
+                  class="preview-image"
+                  :img-props="{ alt: '水印检测区域' }"
+                />
               </div>
             </div>
 
@@ -447,6 +469,12 @@ onUnmounted(() => clearTasks())
   gap: 10px;
 }
 
+.task-meta {
+  margin: 6px 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
 .task-name {
   margin: 0;
   font-size: 0.92rem;
@@ -475,11 +503,27 @@ onUnmounted(() => clearTasks())
 
 .preview {
   width: 100%;
-  max-height: 220px;
+  max-height: 280px;
   object-fit: contain;
   border-radius: 10px;
   background: rgba(0, 0, 0, 0.25);
   border: 1px solid var(--line);
+}
+
+.preview-image {
+  width: 100%;
+  display: block;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.preview-image :deep(img) {
+  width: 100%;
+  max-height: 280px;
+  object-fit: contain;
+  cursor: zoom-in;
 }
 
 .task-actions {
