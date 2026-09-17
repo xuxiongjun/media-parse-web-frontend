@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from 'vue'
-import { NButton, NImage, NProgress, NTag, useMessage } from 'naive-ui'
+import { NButton, NImage, NProgress, NTag, useDialog, useMessage } from 'naive-ui'
 import AppNav from '../components/AppNav.vue'
+import {
+  canUseDirectoryPicker,
+  pickDownloadFolder,
+  writeOneBlobToDirectory
+} from '../api/folderDownload'
 import {
   isImageName,
   isVideoName,
@@ -15,6 +20,7 @@ import { processImageFile } from '../utils/watermark/processImage'
 import type { UploadMode, WatermarkTask } from '../utils/watermark/types'
 
 const message = useMessage()
+const dialog = useDialog()
 
 const uploadMode = ref<UploadMode | null>(null)
 const tasks = ref<WatermarkTask[]>([])
@@ -24,6 +30,12 @@ const progressTotal = ref(0)
 const progressPhase = ref('')
 const fileProgress = ref(0)
 const fileInputRef = ref<HTMLInputElement | null>(null)
+
+const downloadingAll = ref(false)
+const downloadSaveDone = ref(0)
+const downloadSaveTotal = ref(0)
+const downloadSaveLabel = ref('')
+const downloadSaveFailHint = ref('')
 
 let idSeq = 0
 function nextId() {
@@ -253,23 +265,128 @@ function downloadExt(task: WatermarkTask) {
   return 'mp4'
 }
 
+function resultFilename(task: WatermarkTask) {
+  const base = task.name.replace(/\.[^.]+$/, '') || 'result'
+  return `${base}-nowm.${downloadExt(task)}`
+}
+
 function downloadTask(task: WatermarkTask) {
   if (!task.resultBlob) return
-  const base = task.name.replace(/\.[^.]+$/, '')
   const a = document.createElement('a')
   a.href = URL.createObjectURL(task.resultBlob)
-  a.download = `${base}-nowm.${downloadExt(task)}`
+  a.download = resultFilename(task)
   a.click()
   URL.revokeObjectURL(a.href)
 }
 
-function downloadAll() {
+async function downloadTasksWithBrowserQueue(doneTasks: WatermarkTask[]) {
+  for (let i = 0; i < doneTasks.length; i++) {
+    downloadSaveLabel.value = doneTasks[i].name
+    downloadTask(doneTasks[i])
+    downloadSaveDone.value = i + 1
+    await new Promise((r) => setTimeout(r, 280))
+  }
+}
+
+async function downloadAll() {
   const doneTasks = tasks.value.filter((t) => t.status === 'done' && t.resultBlob)
   if (!doneTasks.length) {
     message.info('暂无可下载结果')
     return
   }
-  for (const task of doneTasks) downloadTask(task)
+  if (downloadingAll.value) return
+
+  downloadingAll.value = true
+  downloadSaveDone.value = 0
+  downloadSaveTotal.value = doneTasks.length
+  downloadSaveLabel.value = ''
+  downloadSaveFailHint.value = ''
+
+  try {
+    if (!canUseDirectoryPicker()) {
+      message.info('当前浏览器不支持选文件夹，将逐个触发下载（可能需允许「多个下载」）')
+      await downloadTasksWithBrowserQueue(doneTasks)
+      dialog.info({
+        title: '下载结果',
+        content: `已触发下载（${doneTasks.length} 个文件）`,
+        positiveText: '知道了'
+      })
+      return
+    }
+
+    const picked = await pickDownloadFolder()
+    if (!picked.ok) {
+      if ('cancelled' in picked && picked.cancelled) {
+        message.info('已取消选择文件夹')
+        return
+      }
+      if ('denied' in picked && picked.denied) {
+        message.error('浏览器未授权写入所选文件夹，请重新选择并允许访问')
+        return
+      }
+      message.info('当前浏览器不支持选文件夹，将逐个触发下载（可能需允许「多个下载」）')
+      await downloadTasksWithBrowserQueue(doneTasks)
+      dialog.info({
+        title: '下载结果',
+        content: `已触发下载（${doneTasks.length} 个文件）`,
+        positiveText: '知道了'
+      })
+      return
+    }
+
+    const usedNames = new Set<string>()
+    let ok = 0
+    let fail = 0
+    const failReasons: string[] = []
+
+    for (let i = 0; i < doneTasks.length; i++) {
+      const task = doneTasks[i]
+      const filename = resultFilename(task)
+      downloadSaveLabel.value = task.name
+      downloadSaveFailHint.value = ''
+
+      const result = await writeOneBlobToDirectory(
+        picked.dir,
+        {
+          blob: task.resultBlob!,
+          filename,
+          label: task.name
+        },
+        { index: i, usedNames }
+      )
+
+      downloadSaveDone.value = i + 1
+      if (result.ok) {
+        ok += 1
+      } else {
+        fail += 1
+        downloadSaveFailHint.value = `已跳过：${task.name}（${result.reason}）`
+        failReasons.push(`${task.name}：${result.reason}`)
+      }
+    }
+
+    if (fail === 0) {
+      dialog.info({
+        title: '下载结果',
+        content: `已保存 ${ok} 个文件到所选文件夹`,
+        positiveText: '知道了'
+      })
+    } else {
+      dialog.warning({
+        title: '下载结果',
+        content: `成功 ${ok}，失败 ${fail}${failReasons.length ? `\n${failReasons.slice(0, 5).join('\n')}` : ''}`,
+        positiveText: '知道了'
+      })
+    }
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '保存失败')
+  } finally {
+    downloadingAll.value = false
+    downloadSaveDone.value = 0
+    downloadSaveTotal.value = 0
+    downloadSaveLabel.value = ''
+    downloadSaveFailHint.value = ''
+  }
 }
 
 function statusTag(task: WatermarkTask) {
@@ -348,8 +465,25 @@ onUnmounted(() => clearTasks())
       <section v-if="hasTasks" class="panel">
         <div class="panel-head">
           <p class="label">任务列表（{{ tasks.length }}）</p>
-          <NButton size="tiny" secondary :disabled="!doneCount" @click="downloadAll">下载全部结果</NButton>
+          <NButton
+            size="tiny"
+            secondary
+            :loading="downloadingAll"
+            :disabled="!doneCount || downloadingAll || processing"
+            @click="downloadAll"
+          >
+            <template v-if="downloadingAll && downloadSaveTotal">
+              保存中 {{ downloadSaveDone }}/{{ downloadSaveTotal }}
+            </template>
+            <template v-else>下载全部结果{{ doneCount ? `（${doneCount}）` : '' }}</template>
+          </NButton>
         </div>
+        <p v-if="downloadingAll && downloadSaveLabel" class="download-current">
+          当前：{{ downloadSaveLabel }}
+        </p>
+        <p v-if="downloadingAll && downloadSaveFailHint" class="download-skip">
+          {{ downloadSaveFailHint }}
+        </p>
 
         <div class="task-list">
           <article v-for="task in tasks" :key="task.id" class="task-card">
@@ -396,7 +530,13 @@ onUnmounted(() => clearTasks())
             </div>
 
             <div class="task-actions">
-              <NButton v-if="task.status === 'done'" size="small" type="primary" @click="downloadTask(task)">
+              <NButton
+                v-if="task.status === 'done'"
+                size="small"
+                type="primary"
+                :disabled="downloadingAll"
+                @click="downloadTask(task)"
+              >
                 下载结果
               </NButton>
             </div>
@@ -530,5 +670,16 @@ onUnmounted(() => clearTasks())
   margin-top: 10px;
   display: flex;
   justify-content: flex-end;
+}
+
+.download-current,
+.download-skip {
+  margin: 0 0 10px;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.download-skip {
+  color: var(--danger);
 }
 </style>

@@ -437,6 +437,58 @@ export async function writeOneUrlToDirectory(
   }
 }
 
+export type FolderBlobItem = {
+  blob: Blob
+  /** 期望文件名，如 a-nowm.png */
+  filename: string
+  label?: string
+}
+
+/**
+ * 将内存中的 Blob 写入已选目录（去水印本地结果等场景）。
+ */
+export async function writeOneBlobToDirectory(
+  dir: FileSystemDirectoryHandle,
+  item: FolderBlobItem,
+  options?: {
+    index?: number
+    usedNames?: Set<string>
+  }
+): Promise<WriteOneResult> {
+  const index = options?.index ?? 0
+  const usedNames = options?.usedNames ?? new Set<string>()
+  const label = item.label?.trim() || item.filename || `第 ${index + 1} 个文件`
+  const preferred = sanitizeFilename(item.filename || `result-${index + 1}.bin`)
+  const filename = nextUniqueFilename(usedNames, preferred)
+
+  try {
+    const { fileHandle, name } = await getWritableFileHandle(
+      dir,
+      filename,
+      usedNames,
+      index,
+      item.blob.type || null
+    )
+    const writable = await fileHandle.createWritable()
+    try {
+      await writable.write(item.blob)
+      await writable.close()
+    } catch (err) {
+      try {
+        await writable.abort()
+      } catch {
+        /* ignore */
+      }
+      await removePartialFile(dir, name, usedNames)
+      throw err
+    }
+    await yieldToUi()
+    return { ok: true, name, label }
+  } catch (err) {
+    return { ok: false, url: item.filename, label, reason: failReason(err) }
+  }
+}
+
 /** 向已选目录批量写入（不弹选目录）。默认有限并发，避免串行过慢。 */
 export async function writeUrlsToDirectory(
   dir: FileSystemDirectoryHandle,
