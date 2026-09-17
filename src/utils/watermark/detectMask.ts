@@ -1,4 +1,4 @@
-import type { DetectResult } from './types'
+import type { DetectResult, WatermarkBox } from './types'
 
 interface RegionSpec {
   label: string
@@ -57,12 +57,7 @@ function regionVariance(data: Uint8ClampedArray, w: number, x0: number, y0: numb
   return sumSq / count - mean * mean
 }
 
-function scoreRegion(
-  data: Uint8ClampedArray,
-  width: number,
-  height: number,
-  region: RegionSpec
-): number {
+function scoreRegion(data: Uint8ClampedArray, width: number, height: number, region: RegionSpec): number {
   const x0 = Math.floor(width * region.xRatio)
   const y0 = Math.floor(height * region.yRatio)
   const rw = Math.max(8, Math.floor(width * region.wRatio))
@@ -140,6 +135,41 @@ function maskPixelCount(mask: Uint8Array) {
   return n
 }
 
+/** 从掩膜求外接矩形，并略微外扩；宽高改为奇数以兼容 ffmpeg delogo */
+export function maskToBox(mask: Uint8Array, width: number, height: number, pad = 6): WatermarkBox {
+  let minX = width
+  let minY = height
+  let maxX = -1
+  let maxY = -1
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!mask[y * width + x]) continue
+      if (x < minX) minX = x
+      if (y < minY) minY = y
+      if (x > maxX) maxX = x
+      if (y > maxY) maxY = y
+    }
+  }
+  if (maxX < 0) {
+    return {
+      x: Math.floor(width * 0.7),
+      y: Math.floor(height * 0.8),
+      w: Math.floor(width * 0.28) | 1,
+      h: Math.floor(height * 0.18) | 1
+    }
+  }
+
+  let x = Math.max(0, minX - pad)
+  let y = Math.max(0, minY - pad)
+  let w = Math.min(width - x, maxX - minX + 1 + pad * 2)
+  let h = Math.min(height - y, maxY - minY + 1 + pad * 2)
+  if (w % 2 === 0) w = Math.min(width - x, w + 1)
+  if (h % 2 === 0) h = Math.min(height - y, h + 1)
+  if (w < 3) w = Math.min(width - x, 3)
+  if (h < 3) h = Math.min(height - y, 3)
+  return { x, y, w, h }
+}
+
 /** 自动检测水印区域并生成修复掩膜 */
 export function detectWatermarkMask(imageData: ImageData): DetectResult {
   const { data, width, height } = imageData
@@ -168,8 +198,29 @@ export function detectWatermarkMask(imageData: ImageData): DetectResult {
     width,
     height,
     confidence,
-    regionLabel: bestRegion.label
+    regionLabel: bestRegion.label,
+    box: maskToBox(mask, width, height)
   }
+}
+
+export function maskToPreviewData(
+  mask: Uint8Array,
+  width: number,
+  height: number
+): { buffer: ArrayBuffer; width: number; height: number } {
+  const out = new Uint8ClampedArray(width * height * 4)
+  for (let i = 0; i < mask.length; i++) {
+    const o = i * 4
+    if (mask[i]) {
+      out[o] = 45
+      out[o + 1] = 212
+      out[o + 2] = 168
+      out[o + 3] = 180
+    } else {
+      out[o + 3] = 40
+    }
+  }
+  return { buffer: out.buffer, width, height }
 }
 
 export function maskToPreviewUrl(mask: Uint8Array, width: number, height: number): string {
@@ -178,18 +229,7 @@ export function maskToPreviewUrl(mask: Uint8Array, width: number, height: number
   canvas.height = height
   const ctx = canvas.getContext('2d')
   if (!ctx) return ''
-  const out = ctx.createImageData(width, height)
-  for (let i = 0; i < mask.length; i++) {
-    const o = i * 4
-    if (mask[i]) {
-      out.data[o] = 45
-      out.data[o + 1] = 212
-      out.data[o + 2] = 168
-      out.data[o + 3] = 180
-    } else {
-      out.data[o + 3] = 40
-    }
-  }
-  ctx.putImageData(out, 0, 0)
+  const preview = maskToPreviewData(mask, width, height)
+  ctx.putImageData(new ImageData(new Uint8ClampedArray(preview.buffer), width, height), 0, 0)
   return canvas.toDataURL('image/png')
 }

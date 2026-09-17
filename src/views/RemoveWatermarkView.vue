@@ -12,7 +12,6 @@ import {
 } from '../utils/watermark/fileRules'
 import { extractImagesFromZip } from '../utils/watermark/zipExtract'
 import { processImageFile } from '../utils/watermark/processImage'
-import { processVideoFile } from '../utils/watermark/processVideo'
 import type { UploadMode, WatermarkTask } from '../utils/watermark/types'
 
 const message = useMessage()
@@ -22,6 +21,8 @@ const tasks = ref<WatermarkTask[]>([])
 const processing = ref(false)
 const progressDone = ref(0)
 const progressTotal = ref(0)
+const progressPhase = ref('')
+const fileProgress = ref(0)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 
 let idSeq = 0
@@ -45,7 +46,7 @@ const modeHint = computed(() => {
   if (!uploadMode.value) return '一次仅选一种类型：多张图片 / 单个 zip / 单个视频'
   if (uploadMode.value === 'images') return `已选图片模式 · 最多 ${MAX_IMAGES} 张 · 单张 ≤ ${MAX_IMAGE_BYTES / 1024 / 1024}MB`
   if (uploadMode.value === 'zip') return '已选 zip 模式 · 仅支持 1 个压缩包'
-  return `已选视频模式 · 仅 1 个文件 · ≤ ${MAX_VIDEO_BYTES / 1024 / 1024}MB · 时长 ≤ 20 秒（浏览器处理）`
+  return `已选视频模式 · 仅 1 个文件 · ≤ ${MAX_VIDEO_BYTES / 1024 / 1024}MB · 时长 ≤ 45 秒 · 保留原声`
 })
 
 function revokeTaskUrls(task: WatermarkTask) {
@@ -60,6 +61,8 @@ function clearTasks() {
   uploadMode.value = null
   progressDone.value = 0
   progressTotal.value = 0
+  progressPhase.value = ''
+  fileProgress.value = 0
 }
 
 function detectModeFromFile(file: File): UploadMode {
@@ -186,6 +189,8 @@ function openPicker() {
 async function processOne(task: WatermarkTask) {
   task.status = 'processing'
   task.error = null
+  fileProgress.value = 0
+  progressPhase.value = task.kind === 'image' ? 'Worker 处理图片中' : '准备处理视频'
   try {
     if (task.kind === 'image') {
       const result = await processImageFile(task.sourceFile)
@@ -194,15 +199,20 @@ async function processOne(task: WatermarkTask) {
       task.resultUrl = result.previewUrl
       task.maskPreviewUrl = result.maskPreviewUrl
       task.status = 'done'
+      fileProgress.value = 100
     } else {
-      const result = await processVideoFile(task.sourceFile, (p) => {
-        progressDone.value = Math.max(progressDone.value, p)
+      const { processVideoFile } = await import('../utils/watermark/processVideo')
+      const result = await processVideoFile(task.sourceFile, (p, phase) => {
+        fileProgress.value = p
+        if (phase) progressPhase.value = phase
       })
       if (task.resultUrl) URL.revokeObjectURL(task.resultUrl)
       task.resultBlob = result.blob
       task.resultUrl = result.previewUrl
+      task.maskPreviewUrl = result.maskPreviewUrl
       task.status = 'done'
-      message.info(result.note)
+      fileProgress.value = 100
+      message.success(result.note)
     }
   } catch (e) {
     task.status = 'error'
@@ -222,21 +232,29 @@ async function onStartProcess() {
   let done = 0
   for (const task of pending) {
     await processOne(task)
+    fileProgress.value = 0
     done += 1
     progressDone.value = done
   }
   processing.value = false
+  progressPhase.value = ''
   if (failCount.value) message.warning(`完成：成功 ${doneCount.value}，失败 ${failCount.value}`)
   else message.success(`全部处理完成（${doneCount.value}）`)
 }
 
+function downloadExt(task: WatermarkTask) {
+  if (task.kind === 'image') return 'png'
+  const type = task.resultBlob?.type || ''
+  if (type.includes('webm')) return 'webm'
+  return 'mp4'
+}
+
 function downloadTask(task: WatermarkTask) {
   if (!task.resultBlob) return
-  const ext = task.kind === 'video' ? 'webm' : 'png'
   const base = task.name.replace(/\.[^.]+$/, '')
   const a = document.createElement('a')
   a.href = URL.createObjectURL(task.resultBlob)
-  a.download = `${base}-nowm.${ext}`
+  a.download = `${base}-nowm.${downloadExt(task)}`
   a.click()
   URL.revokeObjectURL(a.href)
 }
@@ -268,7 +286,7 @@ onUnmounted(() => clearTasks())
       <header class="hero">
         <h1 class="headline">上传图片或短视频，自动识别并去除水印</h1>
         <p class="sub">
-          Render 免费方案：全部在浏览器本地处理，不占用服务器算力。一次只能选一种类型（图片 / zip / 视频），自动检测边角与底部水印区域。
+          全部在浏览器本地处理。图片走 Web Worker 防卡顿；视频首次处理时懒加载 ffmpeg（约 30MB，仅下一次），处理后保留原声轨。一次只能选一种类型。
         </p>
       </header>
 
@@ -289,7 +307,7 @@ onUnmounted(() => clearTasks())
 
         <div class="upload-zone" @click="openPicker">
           <p class="upload-title">点击选择文件</p>
-          <p class="upload-desc">支持 jpg / png / webp / bmp · zip 压缩包 · mp4 / webm / mov（≤20 秒）</p>
+          <p class="upload-desc">支持 jpg / png / webp / bmp · zip 压缩包 · mp4 / webm / mov（≤45 秒，保留音轨）</p>
         </div>
 
         <div class="actions">
@@ -304,11 +322,21 @@ onUnmounted(() => clearTasks())
       <section v-if="processing || progressTotal" class="panel">
         <div class="panel-head">
           <p class="label">处理进度</p>
-          <span class="hint-inline">{{ progressDone }} / {{ progressTotal || tasks.length }}</span>
+          <span class="hint-inline">
+            {{ progressDone }} / {{ progressTotal || tasks.length }}
+            <template v-if="progressPhase"> · {{ progressPhase }}</template>
+          </span>
         </div>
         <NProgress
           type="line"
-          :percentage="progressTotal ? Math.round((progressDone / progressTotal) * 100) : 0"
+          :percentage="
+            progressTotal
+              ? Math.min(
+                  100,
+                  Math.round(((progressDone + fileProgress / 100) / progressTotal) * 100)
+                )
+              : 0
+          "
           :show-indicator="true"
         />
       </section>

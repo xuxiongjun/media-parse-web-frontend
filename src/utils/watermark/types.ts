@@ -15,10 +15,18 @@ export interface WatermarkTask {
   maskPreviewUrl: string | null
 }
 
+export interface WatermarkBox {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
 export interface DetectResult {
   mask: Uint8Array
   width: number
   height: number
   confidence: number
   regionLabel: string
+  box: WatermarkBox
 }
