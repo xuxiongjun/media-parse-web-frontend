@@ -28,6 +28,7 @@ import {
   pickDownloadFolder,
   writeOneUrlToDirectory
 } from '../api/folderDownload'
+import AppNav from '../components/AppNav.vue'
 
 type ItemStatus = 'idle' | 'parsing' | 'done' | 'error'
 
@@ -1228,8 +1229,8 @@ async function retryFailed() {
 <template>
   <div class="page">
     <main class="shell">
+      <AppNav />
       <header class="hero">
-        <p class="brand">清影解析</p>
         <h1 class="headline">粘贴分享链接，批量获取可预览与下载的视频 / 图集</h1>
         <p class="sub">
           支持抖音、小红书。一次最多 {{ MAX_QUEUE }} 条；下载全部时若链接临近过期会自动重新解析。

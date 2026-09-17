@@ -6,7 +6,7 @@ import {
   darkTheme,
   type GlobalThemeOverrides
 } from 'naive-ui'
-import HomeView from './views/HomeView.vue'
+import { RouterView } from 'vue-router'
 
 const themeOverrides: GlobalThemeOverrides = {
   common: {
@@ -47,7 +47,7 @@ const themeOverrides: GlobalThemeOverrides = {
   <NConfigProvider :theme="darkTheme" :theme-overrides="themeOverrides">
     <NMessageProvider>
       <NDialogProvider>
-        <HomeView />
+        <RouterView />
       </NDialogProvider>
     </NMessageProvider>
   </NConfigProvider>

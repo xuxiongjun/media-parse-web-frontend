@@ -1,0 +1,79 @@
+.page {
+  min-height: 100vh;
+  padding: 28px 16px 40px;
+  display: flex;
+  justify-content: center;
+}
+
+.shell {
+  width: min(920px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.hero {
+  padding: 12px 4px 0;
+}
+
+.brand {
+  margin: 0 0 10px;
+  font-family: var(--font-display);
+  font-size: clamp(2rem, 5vw, 2.8rem);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  line-height: 1.1;
+}
+
+.headline {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(1.15rem, 2.6vw, 1.45rem);
+  font-weight: 500;
+  line-height: 1.45;
+  color: var(--ink);
+}
+
+.sub {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.6;
+  max-width: 42rem;
+}
+
+.panel {
+  background: rgba(16, 32, 28, 0.72);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.hint-inline {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+@media (max-width: 640px) {
+  .page {
+    padding: 20px 12px 32px;
+  }
+}
