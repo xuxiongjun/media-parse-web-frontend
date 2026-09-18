@@ -14,9 +14,13 @@ export interface FetchImagesResult {
   expireAt?: number
 }
 
+/** 线上无 Vite 代理，超时必须配在 axios / fetch 上 */
+export const FETCH_IMAGES_TIMEOUT_MS = 180_000
+export const MEDIA_DOWNLOAD_TIMEOUT_MS = 120_000
+
 const http = axios.create({
   baseURL: API_BASE || undefined,
-  timeout: 180000
+  timeout: FETCH_IMAGES_TIMEOUT_MS
 })
 
 function withAbsoluteUrls(data: FetchImagesResult): FetchImagesResult {
@@ -28,7 +32,11 @@ function withAbsoluteUrls(data: FetchImagesResult): FetchImagesResult {
 
 /** 从豆包等 AI 聊天 / 分享链接抓取图片代理地址 */
 export async function fetchChatImages(url: string): Promise<FetchImagesResult> {
-  const { data } = await http.post<FetchImagesResult>('/api/watermark/fetch-images', { url })
+  const { data } = await http.post<FetchImagesResult>(
+    '/api/watermark/fetch-images',
+    { url },
+    { timeout: FETCH_IMAGES_TIMEOUT_MS }
+  )
   return withAbsoluteUrls(data)
 }
 
@@ -43,6 +51,9 @@ export function platformAiLabel(platform: string): string {
 
 export function fetchImagesErrorMessage(err: unknown): string {
   if (axios.isAxiosError(err)) {
+    if (err.code === 'ECONNABORTED' || /timeout/i.test(err.message)) {
+      return '拉取超时，请稍后重试（大图较多时可能需要更久）'
+    }
     const data = err.response?.data as ApiErrorBody | undefined
     return data?.message || '拉取图片失败，请稍后重试'
   }
@@ -58,20 +69,35 @@ export function isFetchRateLimited(err: unknown): boolean {
 
 /** 通过代理 URL 拉取图片并转为 File，供去水印任务使用 */
 export async function proxyUrlToFile(proxyUrl: string, filename: string): Promise<File> {
-  const res = await fetch(proxyUrl, { credentials: 'omit', cache: 'no-store' })
-  if (!res.ok) {
-    throw new Error(`下载图片失败（${res.status}）`)
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), MEDIA_DOWNLOAD_TIMEOUT_MS)
+  try {
+    const res = await fetch(proxyUrl, {
+      credentials: 'omit',
+      cache: 'no-store',
+      signal: controller.signal
+    })
+    if (!res.ok) {
+      throw new Error(`下载图片失败（${res.status}）`)
+    }
+    const buf = await res.arrayBuffer()
+    if (buf.byteLength < 8_192) {
+      throw new Error(`图片过小（${buf.byteLength}B），可能不是原图`)
+    }
+    if (!looksLikeImageBytes(buf)) {
+      throw new Error('下载内容不是有效图片')
+    }
+    const type = sniffImageType(buf) || res.headers.get('content-type') || 'image/jpeg'
+    const name = ensureExt(filename || guessNameFromType(type), type)
+    return new File([buf], name, { type })
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error('下载图片超时，请稍后重试')
+    }
+    throw err
+  } finally {
+    window.clearTimeout(timer)
   }
-  const buf = await res.arrayBuffer()
-  if (buf.byteLength < 8_192) {
-    throw new Error(`图片过小（${buf.byteLength}B），可能不是原图`)
-  }
-  if (!looksLikeImageBytes(buf)) {
-    throw new Error('下载内容不是有效图片')
-  }
-  const type = sniffImageType(buf) || res.headers.get('content-type') || 'image/jpeg'
-  const name = ensureExt(filename || guessNameFromType(type), type)
-  return new File([buf], name, { type })
 }
 
 function looksLikeImageBytes(buf: ArrayBuffer): boolean {

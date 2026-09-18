@@ -38,6 +38,7 @@ interface LinkQueueItem {
   result: FetchImagesResult | null
   error: string | null
   imageCount: number
+  title: string | null
 }
 
 const message = useMessage()
@@ -274,7 +275,8 @@ function makeLinkItem(raw: string): LinkQueueItem {
     status: 'idle',
     result: null,
     error: null,
-    imageCount: 0
+    imageCount: 0,
+    title: null
   }
 }
 
@@ -368,7 +370,8 @@ async function ingestFetchedImages(item: LinkQueueItem, result: FetchImagesResul
   }
 
   const platform = platformAiLabel(result.platform)
-  const titleBase = (result.title || platform).replace(/[\\/:*?"<>|]+/g, '_').slice(0, 40)
+  const groupTitle = (result.title || platform).trim() || platform
+  const titleBase = groupTitle.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 40)
   let added = 0
   // 顺序拉取，避免大图并发打满代理 / 浏览器
   for (let i = 0; i < urls.length; i++) {
@@ -386,6 +389,7 @@ async function ingestFetchedImages(item: LinkQueueItem, result: FetchImagesResul
     }
   }
   item.imageCount = added
+  item.title = groupTitle
   if (!added) throw new Error('未能加入任何图片任务')
 }
 
@@ -396,11 +400,13 @@ async function fetchOneLink(item: LinkQueueItem) {
     item.error = '无效链接'
     item.result = null
     item.imageCount = 0
+    item.title = null
     return
   }
   item.status = 'fetching'
   item.error = null
   item.imageCount = 0
+  item.title = null
   let attempt = 0
   while (true) {
     try {
@@ -421,6 +427,7 @@ async function fetchOneLink(item: LinkQueueItem) {
         ? err.message || fetchImagesErrorMessage(err)
         : fetchImagesErrorMessage(err)
       item.imageCount = 0
+      item.title = null
       return
     }
   }
@@ -479,6 +486,7 @@ async function onBatchFetchLinks() {
     item.result = null
     item.error = null
     item.imageCount = 0
+    item.title = null
   }
 
   try {
@@ -820,38 +828,43 @@ onUnmounted(() => clearAll())
             <span class="col-status">状态</span>
             <span class="col-act">操作</span>
           </div>
-          <div v-for="(item, index) in linkQueue" :key="item.id" class="queue-row" role="row">
-            <span class="col-idx">{{ index + 1 }}</span>
-            <div class="col-raw">
-              <NInput
-                v-model:value="item.raw"
-                type="textarea"
-                :autosize="{ minRows: 1, maxRows: 3 }"
-                placeholder="粘贴单条 AI 聊天 / 分享链接"
-                :disabled="busy"
-                size="small"
-              />
+          <div v-for="(item, index) in linkQueue" :key="item.id" class="queue-item">
+            <div class="queue-row" role="row">
+              <span class="col-idx">{{ index + 1 }}</span>
+              <div class="col-raw">
+                <NInput
+                  v-model:value="item.raw"
+                  type="textarea"
+                  :autosize="{ minRows: 1, maxRows: 3 }"
+                  placeholder="粘贴单条 AI 聊天 / 分享链接"
+                  :disabled="busy"
+                  size="small"
+                />
+                <p v-if="item.status === 'done' && item.title" class="link-group-title">
+                  分组：{{ item.title }}
+                </p>
+              </div>
+              <span class="col-status">
+                <NTag v-if="item.status === 'idle'" size="small" :bordered="false">待拉取</NTag>
+                <NTag v-else-if="item.status === 'fetching'" size="small" type="info" :bordered="false">
+                  拉取中
+                </NTag>
+                <NTag v-else-if="item.status === 'done'" size="small" type="success" :bordered="false">
+                  {{ item.imageCount ? `${item.imageCount} 张` : '成功' }}
+                </NTag>
+                <NTag v-else size="small" type="error" :bordered="false">失败</NTag>
+              </span>
+              <span class="col-act">
+                <button
+                  type="button"
+                  class="link-btn"
+                  :disabled="busy || linkQueue.length <= 1"
+                  @click="removeLinkRow(item.id)"
+                >
+                  删除
+                </button>
+              </span>
             </div>
-            <span class="col-status">
-              <NTag v-if="item.status === 'idle'" size="small" :bordered="false">待拉取</NTag>
-              <NTag v-else-if="item.status === 'fetching'" size="small" type="info" :bordered="false">
-                拉取中
-              </NTag>
-              <NTag v-else-if="item.status === 'done'" size="small" type="success" :bordered="false">
-                {{ item.imageCount ? `${item.imageCount} 张` : '成功' }}
-              </NTag>
-              <NTag v-else size="small" type="error" :bordered="false">失败</NTag>
-            </span>
-            <span class="col-act">
-              <button
-                type="button"
-                class="link-btn"
-                :disabled="busy || linkQueue.length <= 1"
-                @click="removeLinkRow(item.id)"
-              >
-                删除
-              </button>
-            </span>
           </div>
         </div>
         <p v-if="linkQueue.some((i) => i.error)" class="link-errors">
@@ -1128,6 +1141,19 @@ onUnmounted(() => clearAll())
   gap: 4px;
   font-size: 0.82rem;
   color: var(--danger);
+}
+
+.link-group-title {
+  margin: 6px 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.queue-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
 }
 
 .task-list {
