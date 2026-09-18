@@ -19,6 +19,42 @@ export interface DoubaoHtmlExtractResult {
   title: string | null
 }
 
+export interface DoubaoHtmlBatchResult {
+  docs: DoubaoHtmlExtractResult[]
+  /** 跨文档去重后的全部原图 URL */
+  urls: string[]
+  docCount: number
+}
+
+/**
+ * 将一次粘贴的内容拆成多段完整 HTML（按 <!DOCTYPE html / <html 起点切分）。
+ * 单段或无法识别起点时，整段作为一份源码返回。
+ */
+export function splitHtmlDocuments(raw: string): string[] {
+  const text = raw.trim()
+  if (!text) return []
+
+  const starts: number[] = []
+  const re = /(?:<!DOCTYPE\s+html\b|<html\b)/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    const prev = starts[starts.length - 1]
+    // 同一文档内偶发再出现 <html，过近则忽略
+    if (prev == null || m.index - prev > 800) starts.push(m.index)
+  }
+
+  if (starts.length <= 1) {
+    return text.length >= 80 ? [text] : []
+  }
+
+  const docs: string[] = []
+  for (let i = 0; i < starts.length; i++) {
+    const chunk = text.slice(starts[i], starts[i + 1]).trim()
+    if (chunk.length >= 80) docs.push(chunk)
+  }
+  return docs.length ? docs : [text]
+}
+
 export function extractDoubaoFromHtml(rawHtml: string): DoubaoHtmlExtractResult {
   const html = normalizeHtml(rawHtml)
   const byId = new Map<string, string>()
@@ -39,6 +75,30 @@ export function extractDoubaoFromHtml(rawHtml: string): DoubaoHtmlExtractResult 
   return {
     urls,
     title: extractTitle(html)
+  }
+}
+
+/** 支持一次粘贴多段网页源码，按文档提取并跨文档去重。 */
+export function extractDoubaoFromHtmlBatch(rawHtml: string): DoubaoHtmlBatchResult {
+  const parts = splitHtmlDocuments(rawHtml)
+  const docs: DoubaoHtmlExtractResult[] = []
+  const seen = new Map<string, string>()
+
+  for (const part of parts) {
+    const one = extractDoubaoFromHtml(part)
+    docs.push(one)
+    for (const url of one.urls) {
+      const key = imageKey(url)
+      if (!seen.has(key)) seen.set(key, url)
+      if (seen.size >= MAX_IMAGES) break
+    }
+    if (seen.size >= MAX_IMAGES) break
+  }
+
+  return {
+    docs,
+    urls: [...seen.values()],
+    docCount: parts.length
   }
 }
 

@@ -18,7 +18,7 @@ import {
   proxyUrlToFile,
   type FetchImagesResult
 } from '../api/watermarkFetch'
-import { extractDoubaoFromHtml } from '../utils/watermark/doubaoHtmlExtract'
+import { extractDoubaoFromHtmlBatch, splitHtmlDocuments } from '../utils/watermark/doubaoHtmlExtract'
 import {
   isImageName,
   isVideoName,
@@ -110,6 +110,11 @@ const linkFailCount = computed(() => linkQueue.value.filter((i) => i.status === 
 const linkSuccessCount = computed(() => linkQueue.value.filter((i) => i.status === 'done').length)
 const busy = computed(() => processing.value || fetchingLinks.value || parsingHtml.value)
 const hasHtmlDraft = computed(() => htmlDraft.value.trim().length > 200)
+const htmlDocCount = computed(() => {
+  const t = htmlDraft.value.trim()
+  if (t.length < 80) return 0
+  return splitHtmlDocuments(t).length
+})
 const isLocalEnv = computed(() => {
   if (import.meta.env.DEV) return true
   if (typeof window === 'undefined') return false
@@ -380,6 +385,29 @@ function onClearLinks() {
   linkProgressTotal.value = 0
 }
 
+async function onAppendHtmlFromClipboard() {
+  if (busy.value) return
+  try {
+    const text = await navigator.clipboard.readText()
+    if (!text?.trim()) {
+      message.warning('剪贴板为空')
+      return
+    }
+    const chunk = text.trim()
+    const prev = htmlDraft.value
+    if (!prev.trim()) {
+      htmlDraft.value = chunk
+    } else {
+      const sep = prev.endsWith('\n') ? '\n' : '\n\n'
+      htmlDraft.value = `${prev}${sep}${chunk}`
+    }
+    const n = splitHtmlDocuments(htmlDraft.value).length
+    message.success(n > 1 ? `已追加，当前共 ${n} 段源码` : '已从剪贴板追加')
+  } catch {
+    message.error('无法读取剪贴板，请手动粘贴到输入框')
+  }
+}
+
 async function onParseHtmlDraft() {
   const html = htmlDraft.value.trim()
   if (!html || html.length < 200) {
@@ -392,8 +420,8 @@ async function onParseHtmlDraft() {
   }
   if (busy.value) return
 
-  const extracted = extractDoubaoFromHtml(html)
-  if (!extracted.urls.length) {
+  const batch = extractDoubaoFromHtmlBatch(html)
+  if (!batch.urls.length) {
     const hasShare = /share_info|share_name|message_snapshot/i.test(html)
     message.error(
       hasShare
@@ -406,36 +434,48 @@ async function onParseHtmlDraft() {
 
   parsingHtml.value = true
   linkProgressDone.value = 0
-  linkProgressTotal.value = extracted.urls.length
-  const groupTitle = (extracted.title || '豆包源码').trim()
-  const titleBase = groupTitle.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 40)
+  linkProgressTotal.value = batch.urls.length
+  const downloadedKeys = new Set<string>()
   let added = 0
   try {
-    for (let i = 0; i < extracted.urls.length; i++) {
-      if (tasks.value.length >= MAX_IMAGES) {
-        message.warning(`已达图片上限 ${MAX_IMAGES} 张，后续已跳过`)
-        break
+    for (let d = 0; d < batch.docs.length; d++) {
+      const doc = batch.docs[d]
+      if (!doc.urls.length) continue
+      const groupTitle = (doc.title || (batch.docCount > 1 ? `豆包源码${d + 1}` : '豆包源码')).trim()
+      const titleBase = groupTitle.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 40)
+      let localIdx = 0
+      for (const url of doc.urls) {
+        if (tasks.value.length >= MAX_IMAGES) {
+          message.warning(`已达图片上限 ${MAX_IMAGES} 张，后续已跳过`)
+          break
+        }
+        const key = url.split('?')[0].toLowerCase()
+        if (downloadedKeys.has(key)) continue
+        downloadedKeys.add(key)
+        localIdx += 1
+        const filename = `${titleBase}_${localIdx}`
+        try {
+          const file = await downloadImageUrlToFile(url, filename)
+          if (addImageTask(file, { readyAsOriginal: true })) added += 1
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : '下载失败'
+          message.warning(`${filename}：${msg}`)
+        }
+        linkProgressDone.value = downloadedKeys.size
       }
-      const filename = `${titleBase}_${i + 1}`
-      try {
-        const file = await downloadImageUrlToFile(extracted.urls[i], filename)
-        if (addImageTask(file, { readyAsOriginal: true })) added += 1
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : '下载失败'
-        message.warning(`${filename}：${msg}`)
-      }
-      linkProgressDone.value = i + 1
+      if (tasks.value.length >= MAX_IMAGES) break
     }
     if (!added) {
       message.error('未能加入任何图片（可能被浏览器跨域拦截，可改用本地保存后上传）')
       return
     }
-    message.success(`已从源码提取 ${added} 张无水印原图`)
-    dialog.info({
+    const docHint = batch.docCount > 1 ? `（来自 ${batch.docCount} 段源码）` : ''
+    message.success(`已提取 ${added} 张无水印原图${docHint}`)
+    dialog.success({
       title: '提取完成',
-      content: `已得到 ${added} 张无水印原图，是否直接下载全部？`,
+      content: `已得到 ${added} 张无水印原图${docHint}，可直接下载，无需再去水印。是否立即下载全部？`,
       positiveText: '下载全部',
-      negativeText: '暂不',
+      negativeText: '先预览',
       onPositiveClick: () => {
         void downloadAll()
       }
@@ -1004,18 +1044,22 @@ onUnmounted(() => {
       <section class="panel">
         <div class="panel-head">
           <label class="label" for="html-source-input">粘贴网页源码（推荐 · 不经后端）</label>
-          <span class="hint-inline">打开豆包 → 右键「查看网页源代码」→ Ctrl+A 复制</span>
+          <span class="hint-inline">
+            打开豆包 → 右键「查看网页源代码」→ Ctrl+A 复制
+            <template v-if="htmlDocCount > 1"> · 已识别 {{ htmlDocCount }} 段</template>
+          </span>
         </div>
         <NInput
           id="html-source-input"
           v-model:value="htmlDraft"
           type="textarea"
           :autosize="{ minRows: 4, maxRows: 12 }"
-          placeholder="在此粘贴完整 HTML 源码，将优先提取 image_ori_raw 无水印原图…"
+          placeholder="在此粘贴完整 HTML 源码；可连续粘贴多段（每段以 &lt;!DOCTYPE html 或 &lt;html 开头），将优先提取 image_ori_raw 无水印原图…"
           :disabled="busy"
         />
         <div class="actions">
           <NButton quaternary :disabled="busy || !htmlDraft.trim()" @click="htmlDraft = ''">清空源码</NButton>
+          <NButton secondary :disabled="busy" @click="onAppendHtmlFromClipboard">从剪贴板追加</NButton>
           <NButton
             type="primary"
             size="large"
@@ -1023,7 +1067,7 @@ onUnmounted(() => {
             :disabled="busy || !hasHtmlDraft"
             @click="onParseHtmlDraft"
           >
-            从源码提取原图
+            {{ htmlDocCount > 1 ? `从源码提取原图（${htmlDocCount} 段）` : '从源码提取原图' }}
           </NButton>
         </div>
       </section>
