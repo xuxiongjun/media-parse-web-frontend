@@ -1,12 +1,22 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from 'vue'
-import { NButton, NImage, NProgress, NTag, useDialog, useMessage } from 'naive-ui'
+import { NButton, NImage, NInput, NProgress, NTag, useDialog, useMessage } from 'naive-ui'
 import AppNav from '../components/AppNav.vue'
 import {
   canUseDirectoryPicker,
   pickDownloadFolder,
   writeOneBlobToDirectory
 } from '../api/folderDownload'
+import {
+  collectShareEntries,
+  extractFirstUrl,
+  fetchChatImages,
+  fetchImagesErrorMessage,
+  isFetchRateLimited,
+  platformAiLabel,
+  proxyUrlToFile,
+  type FetchImagesResult
+} from '../api/watermarkFetch'
 import {
   isImageName,
   isVideoName,
@@ -18,6 +28,17 @@ import {
 import { extractImagesFromZip } from '../utils/watermark/zipExtract'
 import { processImageFile } from '../utils/watermark/processImage'
 import type { UploadMode, WatermarkTask } from '../utils/watermark/types'
+
+type LinkStatus = 'idle' | 'fetching' | 'done' | 'error'
+
+interface LinkQueueItem {
+  id: string
+  raw: string
+  status: LinkStatus
+  result: FetchImagesResult | null
+  error: string | null
+  imageCount: number
+}
 
 const message = useMessage()
 const dialog = useDialog()
@@ -31,11 +52,23 @@ const progressPhase = ref('')
 const fileProgress = ref(0)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 
+const draft = ref('')
+const linkQueue = ref<LinkQueueItem[]>([])
+const fetchingLinks = ref(false)
+const linkProgressDone = ref(0)
+const linkProgressTotal = ref(0)
+
 const downloadingAll = ref(false)
 const downloadSaveDone = ref(0)
 const downloadSaveTotal = ref(0)
 const downloadSaveLabel = ref('')
 const downloadSaveFailHint = ref('')
+
+const MAX_LINK_QUEUE = 99
+const BATCH_CONCURRENCY = 3
+const BATCH_GAP_MS = 280
+const RATE_LIMIT_BACKOFF_MS = 3500
+const RATE_LIMIT_MAX_RETRY = 2
 
 let idSeq = 0
 function nextId() {
@@ -43,9 +76,21 @@ function nextId() {
   return `wm-${idSeq}`
 }
 
+let linkIdSeq = 0
+function nextLinkId() {
+  linkIdSeq += 1
+  return `link-${linkIdSeq}`
+}
+
 const hasTasks = computed(() => tasks.value.length > 0)
 const doneCount = computed(() => tasks.value.filter((t) => t.status === 'done').length)
 const failCount = computed(() => tasks.value.filter((t) => t.status === 'error').length)
+const hasDraft = computed(() => draft.value.trim().length > 0)
+const hasLinkQueue = computed(() => linkQueue.value.length > 0)
+const linkQueueAtLimit = computed(() => linkQueue.value.length >= MAX_LINK_QUEUE)
+const linkFailCount = computed(() => linkQueue.value.filter((i) => i.status === 'error').length)
+const linkSuccessCount = computed(() => linkQueue.value.filter((i) => i.status === 'done').length)
+const busy = computed(() => processing.value || fetchingLinks.value)
 
 const acceptAttr = computed(() => {
   if (uploadMode.value === 'zip') return '.zip'
@@ -55,7 +100,7 @@ const acceptAttr = computed(() => {
 })
 
 const modeHint = computed(() => {
-  if (!uploadMode.value) return '一次仅选一种类型：多张图片 / 单个 zip / 单个视频'
+  if (!uploadMode.value) return '一次仅选一种类型：多张图片 / 单个 zip / 单个视频；也可粘贴 AI 聊天链接拉图'
   if (uploadMode.value === 'images') return `已选图片模式 · 最多 ${MAX_IMAGES} 张 · 单张 ≤ ${MAX_IMAGE_BYTES / 1024 / 1024}MB`
   if (uploadMode.value === 'zip') return '已选 zip 模式 · 仅 1 个压缩包 · 内含图片数量不限制'
   return `已选视频模式 · 仅 1 个文件 · ≤ ${MAX_VIDEO_BYTES / 1024 / 1024}MB · 时长 ≤ 45 秒 · 保留原声`
@@ -77,6 +122,14 @@ function clearTasks() {
   fileProgress.value = 0
 }
 
+function clearAll() {
+  clearTasks()
+  draft.value = ''
+  linkQueue.value = []
+  linkProgressDone.value = 0
+  linkProgressTotal.value = 0
+}
+
 function detectModeFromFile(file: File): UploadMode {
   if (isZipFile(file)) return 'zip'
   if (isVideoName(file.name) || file.type.startsWith('video/')) return 'video'
@@ -96,19 +149,31 @@ function ensureMode(file: File): UploadMode | null {
   return mode
 }
 
-function addImageTask(file: File, options?: { fromZip?: boolean }) {
+function ensureImagesModeForLinks(): boolean {
+  if (!uploadMode.value) {
+    uploadMode.value = 'images'
+    return true
+  }
+  if (uploadMode.value !== 'images') {
+    message.warning('当前是 zip / 视频模式，请先清空再使用链接拉图')
+    return false
+  }
+  return true
+}
+
+function addImageTask(file: File, options?: { fromZip?: boolean }): boolean {
   const fromZip = options?.fromZip === true
   if (!fromZip && file.size > MAX_IMAGE_BYTES) {
     message.error(`${file.name} 超过单张大小限制`)
-    return
+    return false
   }
   if (!isImageName(file.name) && !file.type.startsWith('image/')) {
     message.error(`${file.name} 不是支持的图片格式`)
-    return
+    return false
   }
   if (!fromZip && tasks.value.length >= MAX_IMAGES) {
     message.warning(`最多 ${MAX_IMAGES} 张图片`)
-    return
+    return false
   }
   tasks.value.push({
     id: nextId(),
@@ -123,6 +188,7 @@ function addImageTask(file: File, options?: { fromZip?: boolean }) {
     maskPreviewUrl: null,
     regionLabel: null
   })
+  return true
 }
 
 function addVideoTask(file: File) {
@@ -199,6 +265,279 @@ async function onFilesSelected(event: Event) {
 
 function openPicker() {
   fileInputRef.value?.click()
+}
+
+function makeLinkItem(raw: string): LinkQueueItem {
+  return {
+    id: nextLinkId(),
+    raw,
+    status: 'idle',
+    result: null,
+    error: null,
+    imageCount: 0
+  }
+}
+
+function takeEntriesWithCap(entries: string[]) {
+  if (entries.length <= MAX_LINK_QUEUE) return entries
+  message.warning(`一次最多 ${MAX_LINK_QUEUE} 条，已截取前 ${MAX_LINK_QUEUE} 条`)
+  return entries.slice(0, MAX_LINK_QUEUE)
+}
+
+function syncQueueFromDraft() {
+  const collected = collectShareEntries(draft.value)
+  if (!collected.length) {
+    message.warning('未识别到有效链接，请检查粘贴内容')
+    return
+  }
+  linkQueue.value = takeEntriesWithCap(collected).map(makeLinkItem)
+  message.success(`已整理 ${linkQueue.value.length} 条链接`)
+}
+
+function addEmptyLinkRow() {
+  if (linkQueue.value.length >= MAX_LINK_QUEUE) {
+    message.warning(`列表最多 ${MAX_LINK_QUEUE} 条`)
+    return
+  }
+  linkQueue.value.push(makeLinkItem(''))
+}
+
+function removeLinkRow(id: string) {
+  linkQueue.value = linkQueue.value.filter((i) => i.id !== id)
+}
+
+function onClearLinks() {
+  draft.value = ''
+  linkQueue.value = []
+  linkProgressDone.value = 0
+  linkProgressTotal.value = 0
+}
+
+async function onPasteAndFill() {
+  try {
+    const text = await navigator.clipboard.readText()
+    if (!text?.trim()) {
+      message.warning('剪贴板为空')
+      return
+    }
+    const collected = collectShareEntries(text)
+    if (!collected.length) {
+      message.warning('剪贴板中未识别到链接')
+      return
+    }
+    const existing = new Set(
+      linkQueue.value.map((i) => (extractFirstUrl(i.raw) || i.raw).toLowerCase()).filter(Boolean)
+    )
+    const toAdd: string[] = []
+    for (const entry of collected) {
+      const key = (extractFirstUrl(entry) || entry).toLowerCase()
+      if (existing.has(key)) continue
+      existing.add(key)
+      toAdd.push(entry)
+      if (linkQueue.value.length + toAdd.length >= MAX_LINK_QUEUE) break
+    }
+    if (!toAdd.length) {
+      message.info('没有新的链接可追加')
+      return
+    }
+    linkQueue.value.push(...toAdd.map(makeLinkItem))
+    message.success(`已追加 ${toAdd.length} 条`)
+  } catch {
+    message.error('无法读取剪贴板，请手动粘贴到输入框')
+  }
+}
+
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault()
+    void onBatchFetchLinks()
+  }
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+async function ingestFetchedImages(item: LinkQueueItem, result: FetchImagesResult) {
+  const urls = result.imageProxyUrls || []
+  if (!urls.length) {
+    throw new Error('未获取到图片')
+  }
+  if (!ensureImagesModeForLinks()) {
+    throw new Error('当前模式不支持链接拉图')
+  }
+
+  const platform = platformAiLabel(result.platform)
+  const titleBase = (result.title || platform).replace(/[\\/:*?"<>|]+/g, '_').slice(0, 40)
+  let added = 0
+  // 顺序拉取，避免大图并发打满代理 / 浏览器
+  for (let i = 0; i < urls.length; i++) {
+    if (tasks.value.length >= MAX_IMAGES) {
+      message.warning(`已达图片上限 ${MAX_IMAGES} 张，后续图片已跳过`)
+      break
+    }
+    const filename = `${titleBase}_${i + 1}`
+    try {
+      const file = await proxyUrlToFile(urls[i], filename)
+      if (addImageTask(file)) added += 1
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '下载失败'
+      message.warning(`${filename}：${msg}`)
+    }
+  }
+  item.imageCount = added
+  if (!added) throw new Error('未能加入任何图片任务')
+}
+
+async function fetchOneLink(item: LinkQueueItem) {
+  const raw = item.raw.trim()
+  if (!raw || !extractFirstUrl(raw)) {
+    item.status = 'error'
+    item.error = '无效链接'
+    item.result = null
+    item.imageCount = 0
+    return
+  }
+  item.status = 'fetching'
+  item.error = null
+  item.imageCount = 0
+  let attempt = 0
+  while (true) {
+    try {
+      const result = await fetchChatImages(raw)
+      await ingestFetchedImages(item, result)
+      item.result = result
+      item.status = 'done'
+      return
+    } catch (err) {
+      if (isFetchRateLimited(err) && attempt < RATE_LIMIT_MAX_RETRY) {
+        attempt += 1
+        await sleep(RATE_LIMIT_BACKOFF_MS * attempt)
+        continue
+      }
+      item.result = null
+      item.status = 'error'
+      item.error = err instanceof Error && !isFetchRateLimited(err)
+        ? err.message || fetchImagesErrorMessage(err)
+        : fetchImagesErrorMessage(err)
+      item.imageCount = 0
+      return
+    }
+  }
+}
+
+async function runFetchPool(targets: LinkQueueItem[]) {
+  let cursor = 0
+  let finished = 0
+
+  async function worker() {
+    while (true) {
+      const i = cursor++
+      if (i >= targets.length) return
+      await fetchOneLink(targets[i])
+      finished += 1
+      linkProgressDone.value = finished
+      if (cursor < targets.length) await sleep(BATCH_GAP_MS)
+    }
+  }
+
+  const workers = Math.min(BATCH_CONCURRENCY, targets.length)
+  await Promise.all(Array.from({ length: workers }, () => worker()))
+}
+
+async function onBatchFetchLinks() {
+  if (fetchingLinks.value || processing.value) return
+
+  if (uploadMode.value && uploadMode.value !== 'images') {
+    message.warning('当前是 zip / 视频模式，请先清空再使用链接拉图')
+    return
+  }
+
+  const collected = collectShareEntries(draft.value)
+  if (collected.length) {
+    linkQueue.value = takeEntriesWithCap(collected).map(makeLinkItem)
+  } else if (!linkQueue.value.length) {
+    message.warning('请先粘贴链接，或整理到下方列表')
+    return
+  } else if (linkQueue.value.length > MAX_LINK_QUEUE) {
+    const dropped = linkQueue.value.length - MAX_LINK_QUEUE
+    linkQueue.value = linkQueue.value.slice(0, MAX_LINK_QUEUE)
+    message.warning(`列表最多 ${MAX_LINK_QUEUE} 条，已截取前 ${MAX_LINK_QUEUE} 条，超出 ${dropped} 条未保留`)
+  }
+
+  const targets = linkQueue.value.filter((i) => i.raw.trim())
+  if (!targets.length) {
+    message.warning('列表中没有有效内容')
+    return
+  }
+
+  fetchingLinks.value = true
+  linkProgressDone.value = 0
+  linkProgressTotal.value = targets.length
+  for (const item of targets) {
+    item.status = 'idle'
+    item.result = null
+    item.error = null
+    item.imageCount = 0
+  }
+
+  try {
+    await runFetchPool(targets)
+    const ok = linkSuccessCount.value
+    const bad = linkFailCount.value
+    const imgTotal = linkQueue.value.reduce((n, i) => n + (i.imageCount || 0), 0)
+    if (ok && !bad) {
+      message.success(`已拉取 ${imgTotal} 张图片到任务列表，可开始去水印`)
+      dialog.info({
+        title: '拉取完成',
+        content: `成功 ${ok} 条链接，共 ${imgTotal} 张图片。是否立即开始去水印？`,
+        positiveText: '开始去水印',
+        negativeText: '稍后',
+        onPositiveClick: () => {
+          void onStartProcess()
+        }
+      })
+    } else if (ok && bad) {
+      message.warning(`完成：成功 ${ok}（${imgTotal} 张图），失败 ${bad}`)
+    } else {
+      message.error(`全部失败（${bad}）`)
+    }
+  } finally {
+    fetchingLinks.value = false
+  }
+}
+
+async function retryFailedLinks() {
+  const targets = linkQueue.value.filter((i) => i.status === 'error')
+  if (!targets.length) {
+    message.info('没有失败项')
+    return
+  }
+  if (uploadMode.value && uploadMode.value !== 'images') {
+    message.warning('当前是 zip / 视频模式，请先清空再使用链接拉图')
+    return
+  }
+  fetchingLinks.value = true
+  linkProgressDone.value = 0
+  linkProgressTotal.value = targets.length
+  try {
+    await runFetchPool(targets)
+    message.success(`重试完成：成功 ${linkSuccessCount.value}，失败 ${linkFailCount.value}`)
+  } finally {
+    fetchingLinks.value = false
+  }
+}
+
+function copyFailedLinkTexts() {
+  const texts = linkQueue.value
+    .filter((i) => i.status === 'error')
+    .map((i) => i.raw.trim())
+    .filter(Boolean)
+  if (!texts.length) return
+  void navigator.clipboard.writeText(texts.join('\n')).then(
+    () => message.success(`已复制 ${texts.length} 条失败文案`),
+    () => message.error('复制失败')
+  )
 }
 
 async function processOne(task: WatermarkTask) {
@@ -397,7 +736,7 @@ function statusTag(task: WatermarkTask) {
   return { type: 'error' as const, label: '失败' }
 }
 
-onUnmounted(() => clearTasks())
+onUnmounted(() => clearAll())
 </script>
 
 <template>
@@ -406,11 +745,138 @@ onUnmounted(() => clearTasks())
       <AppNav />
 
       <header class="hero">
-        <h1 class="headline">上传图片或短视频，自动识别并去除水印</h1>
+        <h1 class="headline">上传文件或粘贴 AI 聊天链接，自动识别并去除水印</h1>
         <p class="sub">
-          全部在浏览器本地处理。图片走 Web Worker；自动识别角标白字，并用上方路面纹理克隆修复（非纯色色块）。视频首次处理会懒加载 ffmpeg。一次只能选一种类型。
+          支持豆包等分享链接批量拉图；也可本地上传图片 / zip / 短视频。图片与链接走同一去水印流水线；一次只能选一种类型。
         </p>
       </header>
+
+      <section class="panel">
+        <div class="panel-head">
+          <label class="label" for="ai-link-input">粘贴 AI 聊天链接</label>
+          <span class="hint-inline">每行一条 · 最多 {{ MAX_LINK_QUEUE }} 条 · Ctrl/⌘ + Enter 拉取</span>
+        </div>
+        <NInput
+          id="ai-link-input"
+          v-model:value="draft"
+          type="textarea"
+          :autosize="{ minRows: 4, maxRows: 10 }"
+          placeholder="可一次粘贴多条，例如：&#10;https://www.doubao.com/thread/xxxxx&#10;https://www.doubao.com/thread/yyyyy"
+          :disabled="busy"
+          @keydown="onKeydown"
+        />
+        <div class="actions">
+          <NButton quaternary :disabled="busy || (!hasDraft && !hasLinkQueue)" @click="onClearLinks">
+            清空链接
+          </NButton>
+          <NButton secondary :disabled="busy || !hasDraft" @click="syncQueueFromDraft">
+            整理到列表
+          </NButton>
+          <NButton secondary :disabled="busy" @click="onPasteAndFill">从剪贴板追加</NButton>
+          <NButton
+            type="primary"
+            size="large"
+            :loading="fetchingLinks"
+            :disabled="busy || (!hasLinkQueue && !hasDraft)"
+            @click="onBatchFetchLinks"
+          >
+            {{ hasLinkQueue && linkQueue.length > 1 ? `批量拉取（${linkQueue.length}）` : '拉取图片' }}
+          </NButton>
+        </div>
+      </section>
+
+      <section v-if="hasLinkQueue" class="panel queue-panel">
+        <div class="panel-head">
+          <p class="label">待拉取列表（{{ linkQueue.length }}/{{ MAX_LINK_QUEUE }}）</p>
+          <div class="panel-head-actions">
+            <NButton
+              v-if="linkFailCount > 0"
+              size="tiny"
+              secondary
+              :disabled="busy"
+              @click="copyFailedLinkTexts"
+            >
+              复制失败文案（{{ linkFailCount }}）
+            </NButton>
+            <NButton
+              v-if="linkFailCount > 0"
+              size="tiny"
+              type="warning"
+              secondary
+              :disabled="busy"
+              @click="retryFailedLinks"
+            >
+              重试失败（{{ linkFailCount }}）
+            </NButton>
+            <NButton size="tiny" quaternary :disabled="busy || linkQueueAtLimit" @click="addEmptyLinkRow">
+              添加一行
+            </NButton>
+          </div>
+        </div>
+        <div class="queue-table" role="table">
+          <div class="queue-row queue-head" role="row">
+            <span class="col-idx">#</span>
+            <span class="col-raw">分享文案 / 链接</span>
+            <span class="col-status">状态</span>
+            <span class="col-act">操作</span>
+          </div>
+          <div v-for="(item, index) in linkQueue" :key="item.id" class="queue-row" role="row">
+            <span class="col-idx">{{ index + 1 }}</span>
+            <div class="col-raw">
+              <NInput
+                v-model:value="item.raw"
+                type="textarea"
+                :autosize="{ minRows: 1, maxRows: 3 }"
+                placeholder="粘贴单条 AI 聊天 / 分享链接"
+                :disabled="busy"
+                size="small"
+              />
+            </div>
+            <span class="col-status">
+              <NTag v-if="item.status === 'idle'" size="small" :bordered="false">待拉取</NTag>
+              <NTag v-else-if="item.status === 'fetching'" size="small" type="info" :bordered="false">
+                拉取中
+              </NTag>
+              <NTag v-else-if="item.status === 'done'" size="small" type="success" :bordered="false">
+                {{ item.imageCount ? `${item.imageCount} 张` : '成功' }}
+              </NTag>
+              <NTag v-else size="small" type="error" :bordered="false">失败</NTag>
+            </span>
+            <span class="col-act">
+              <button
+                type="button"
+                class="link-btn"
+                :disabled="busy || linkQueue.length <= 1"
+                @click="removeLinkRow(item.id)"
+              >
+                删除
+              </button>
+            </span>
+          </div>
+        </div>
+        <p v-if="linkQueue.some((i) => i.error)" class="link-errors">
+          <template v-for="item in linkQueue.filter((i) => i.error)" :key="item.id">
+            <span>{{ item.error }}</span>
+          </template>
+        </p>
+      </section>
+
+      <section v-if="fetchingLinks || linkProgressTotal" class="panel">
+        <div class="panel-head">
+          <p class="label">拉图进度</p>
+          <span class="hint-inline">{{ linkProgressDone }} / {{ linkProgressTotal }}</span>
+        </div>
+        <NProgress
+          type="line"
+          :percentage="
+            linkProgressTotal
+              ? Math.min(100, Math.round((linkProgressDone / linkProgressTotal) * 100))
+              : 0
+          "
+          :processing="fetchingLinks"
+          :show-indicator="true"
+        />
+      </section>
 
       <section class="panel">
         <div class="panel-head">
@@ -433,9 +899,15 @@ onUnmounted(() => clearTasks())
         </div>
 
         <div class="actions">
-          <NButton quaternary :disabled="processing || !hasTasks" @click="clearTasks">清空</NButton>
-          <NButton secondary :disabled="processing" @click="openPicker">继续添加</NButton>
-          <NButton type="primary" size="large" :loading="processing" :disabled="processing || !hasTasks" @click="onStartProcess">
+          <NButton quaternary :disabled="busy || !hasTasks" @click="clearTasks">清空任务</NButton>
+          <NButton secondary :disabled="busy" @click="openPicker">继续添加</NButton>
+          <NButton
+            type="primary"
+            size="large"
+            :loading="processing"
+            :disabled="busy || !hasTasks"
+            @click="onStartProcess"
+          >
             开始去水印
           </NButton>
         </div>
@@ -470,7 +942,7 @@ onUnmounted(() => clearTasks())
             size="tiny"
             secondary
             :loading="downloadingAll"
-            :disabled="!doneCount || downloadingAll || processing"
+            :disabled="!doneCount || downloadingAll || busy"
             @click="downloadAll"
           >
             <template v-if="downloadingAll && downloadSaveTotal">
@@ -590,6 +1062,74 @@ onUnmounted(() => clearTasks())
   margin-top: 14px;
 }
 
+.panel-head-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.queue-table {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.queue-row {
+  display: grid;
+  grid-template-columns: 36px 1fr 72px 52px;
+  gap: 10px;
+  align-items: start;
+}
+
+.queue-head {
+  color: var(--muted);
+  font-size: 0.8rem;
+  padding: 0 2px;
+}
+
+.col-idx {
+  padding-top: 8px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.col-status {
+  padding-top: 6px;
+}
+
+.col-act {
+  padding-top: 6px;
+  text-align: right;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0;
+}
+
+.link-btn:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+.link-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.link-errors {
+  margin: 10px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.82rem;
+  color: var(--danger);
+}
+
 .task-list {
   display: flex;
   flex-direction: column;
@@ -682,5 +1222,34 @@ onUnmounted(() => clearTasks())
 
 .download-skip {
   color: var(--danger);
+}
+
+@media (max-width: 640px) {
+  .queue-row {
+    grid-template-columns: 28px 1fr;
+    grid-template-areas:
+      'idx raw'
+      'status act';
+  }
+
+  .col-idx {
+    grid-area: idx;
+  }
+
+  .col-raw {
+    grid-area: raw;
+  }
+
+  .col-status {
+    grid-area: status;
+  }
+
+  .col-act {
+    grid-area: act;
+  }
+
+  .queue-head {
+    display: none;
+  }
 }
 </style>
