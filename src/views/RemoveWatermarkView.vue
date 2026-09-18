@@ -104,6 +104,15 @@ const linkFailCount = computed(() => linkQueue.value.filter((i) => i.status === 
 const linkSuccessCount = computed(() => linkQueue.value.filter((i) => i.status === 'done').length)
 const busy = computed(() => processing.value || fetchingLinks.value || parsingHtml.value)
 const hasHtmlDraft = computed(() => htmlDraft.value.trim().length > 200)
+const isLocalEnv = computed(() => {
+  if (import.meta.env.DEV) return true
+  if (typeof window === 'undefined') return false
+  const host = window.location.hostname
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]'
+})
+
+/** Render 等线上环境暂不展示云端拉链接（机房访问豆包常失败） */
+const showAiLinkFetch = isLocalEnv
 
 const processPercent = computed(() => {
   if (!progressTotal.value) return 0
@@ -140,7 +149,11 @@ const acceptAttr = computed(() => {
 })
 
 const modeHint = computed(() => {
-  if (!uploadMode.value) return '一次仅选一种类型：多张图片 / 单个 zip / 单个视频；也可粘贴 AI 聊天链接拉图'
+  if (!uploadMode.value) {
+    return showAiLinkFetch.value
+      ? '一次仅选一种类型：多张图片 / 单个 zip / 单个视频；也可粘贴 AI 聊天链接拉图'
+      : '一次仅选一种类型：多张图片 / 单个 zip / 单个视频；也可粘贴网页源码提取原图'
+  }
   if (uploadMode.value === 'images') return `已选图片模式 · 最多 ${MAX_IMAGES} 张 · 单张 ≤ ${MAX_IMAGE_BYTES / 1024 / 1024}MB`
   if (uploadMode.value === 'zip') return '已选 zip 模式 · 仅 1 个压缩包 · 内含图片数量不限制'
   return `已选视频模式 · 仅 1 个文件 · ≤ ${MAX_VIDEO_BYTES / 1024 / 1024}MB · 时长 ≤ 45 秒 · 保留原声`
@@ -957,9 +970,16 @@ onUnmounted(() => {
       <AppNav />
 
       <header class="hero">
-        <h1 class="headline">上传文件或粘贴 AI 聊天链接，自动识别并去除水印</h1>
+        <h1 class="headline">
+          {{ showAiLinkFetch ? '上传文件或粘贴 AI 聊天链接，自动识别并去除水印' : '粘贴网页源码或上传文件，自动识别并去除水印' }}
+        </h1>
         <p class="sub">
-          推荐粘贴豆包网页源码在本地提取无水印原图；也支持分享链接云端拉图，或上传图片 / zip / 短视频。一次只能选一种类型。
+          <template v-if="showAiLinkFetch">
+            推荐粘贴豆包网页源码在本地提取无水印原图；也支持分享链接云端拉图，或上传图片 / zip / 短视频。一次只能选一种类型。
+          </template>
+          <template v-else>
+            推荐粘贴豆包网页源码提取无水印原图；也可上传图片 / zip / 短视频。一次只能选一种类型。
+          </template>
         </p>
       </header>
 
@@ -990,10 +1010,10 @@ onUnmounted(() => {
         </div>
       </section>
 
-      <section class="panel">
+      <section v-if="showAiLinkFetch" class="panel">
         <div class="panel-head">
           <label class="label" for="ai-link-input">粘贴 AI 聊天链接</label>
-          <span class="hint-inline">云端拉取 · 每行一条 · 最多 {{ MAX_LINK_QUEUE }} 条</span>
+          <span class="hint-inline">云端拉取 · 每行一条 · 最多 {{ MAX_LINK_QUEUE }} 条 · 仅本地可用</span>
         </div>
         <NInput
           id="ai-link-input"
@@ -1024,7 +1044,7 @@ onUnmounted(() => {
         </div>
       </section>
 
-      <section v-if="hasLinkQueue" class="panel queue-panel">
+      <section v-if="showAiLinkFetch && hasLinkQueue" class="panel queue-panel">
         <div class="panel-head">
           <p class="label">待拉取列表（{{ linkQueue.length }}/{{ MAX_LINK_QUEUE }}）</p>
           <div class="panel-head-actions">
