@@ -9,6 +9,7 @@ import {
 } from '../api/folderDownload'
 import {
   collectShareEntries,
+  downloadImageUrlToFile,
   extractFirstUrl,
   fetchChatImages,
   fetchImagesErrorMessage,
@@ -17,6 +18,7 @@ import {
   proxyUrlToFile,
   type FetchImagesResult
 } from '../api/watermarkFetch'
+import { extractDoubaoFromHtml } from '../utils/watermark/doubaoHtmlExtract'
 import {
   isImageName,
   isVideoName,
@@ -54,10 +56,12 @@ const fileProgress = ref(0)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 
 const draft = ref('')
+const htmlDraft = ref('')
 const linkQueue = ref<LinkQueueItem[]>([])
 const fetchingLinks = ref(false)
 const linkProgressDone = ref(0)
 const linkProgressTotal = ref(0)
+const parsingHtml = ref(false)
 
 const downloadingAll = ref(false)
 const downloadSaveDone = ref(0)
@@ -98,7 +102,8 @@ const hasLinkQueue = computed(() => linkQueue.value.length > 0)
 const linkQueueAtLimit = computed(() => linkQueue.value.length >= MAX_LINK_QUEUE)
 const linkFailCount = computed(() => linkQueue.value.filter((i) => i.status === 'error').length)
 const linkSuccessCount = computed(() => linkQueue.value.filter((i) => i.status === 'done').length)
-const busy = computed(() => processing.value || fetchingLinks.value)
+const busy = computed(() => processing.value || fetchingLinks.value || parsingHtml.value)
+const hasHtmlDraft = computed(() => htmlDraft.value.trim().length > 200)
 
 const processPercent = computed(() => {
   if (!progressTotal.value) return 0
@@ -115,14 +120,14 @@ const linkPercent = computed(() => {
 
 /** 浮动环形进度：拉图或去水印进行中时取当前活动进度 */
 const floatingPercent = computed(() => {
-  if (fetchingLinks.value && linkProgressTotal.value > 0) return linkPercent.value
+  if ((fetchingLinks.value || parsingHtml.value) && linkProgressTotal.value > 0) return linkPercent.value
   if (processing.value && progressTotal.value > 0) return processPercent.value
   return 0
 })
 
 const showFloatingProgress = computed(
   () =>
-    ((fetchingLinks.value && linkProgressTotal.value > 0) ||
+    (((fetchingLinks.value || parsingHtml.value) && linkProgressTotal.value > 0) ||
       (processing.value && progressTotal.value > 0)) &&
     !progressPanelInView.value
 )
@@ -160,6 +165,7 @@ function clearTasks() {
 function clearAll() {
   clearTasks()
   draft.value = ''
+  htmlDraft.value = ''
   linkQueue.value = []
   linkProgressDone.value = 0
   linkProgressTotal.value = 0
@@ -347,6 +353,71 @@ function onClearLinks() {
   linkQueue.value = []
   linkProgressDone.value = 0
   linkProgressTotal.value = 0
+}
+
+async function onParseHtmlDraft() {
+  const html = htmlDraft.value.trim()
+  if (!html || html.length < 200) {
+    message.warning('请粘贴完整的豆包页面源码（右键 → 查看网页源代码 → 全选复制）')
+    return
+  }
+  if (uploadMode.value && uploadMode.value !== 'images') {
+    message.warning('当前是 zip / 视频模式，请先清空再使用')
+    return
+  }
+  if (busy.value) return
+
+  const extracted = extractDoubaoFromHtml(html)
+  if (!extracted.urls.length) {
+    const hasShare = /share_info|share_name|message_snapshot/i.test(html)
+    message.error(
+      hasShare
+        ? '源码里有分享数据，但未解析到图片链接。请用 Ctrl+A 全选整页源码再复制（图片数据通常在页面最底部）。'
+        : '源码中未找到图片。请确认：右键「查看网页源代码」（不是检查元素），Ctrl+A 全选后复制。'
+    )
+    return
+  }
+  if (!ensureImagesModeForLinks()) return
+
+  parsingHtml.value = true
+  linkProgressDone.value = 0
+  linkProgressTotal.value = extracted.urls.length
+  const groupTitle = (extracted.title || '豆包源码').trim()
+  const titleBase = groupTitle.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 40)
+  let added = 0
+  try {
+    for (let i = 0; i < extracted.urls.length; i++) {
+      if (tasks.value.length >= MAX_IMAGES) {
+        message.warning(`已达图片上限 ${MAX_IMAGES} 张，后续已跳过`)
+        break
+      }
+      const filename = `${titleBase}_${i + 1}`
+      try {
+        const file = await downloadImageUrlToFile(extracted.urls[i], filename)
+        if (addImageTask(file)) added += 1
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '下载失败'
+        message.warning(`${filename}：${msg}`)
+      }
+      linkProgressDone.value = i + 1
+    }
+    if (!added) {
+      message.error('未能加入任何图片（可能被浏览器跨域拦截，可改用本地保存后上传）')
+      return
+    }
+    message.success(`已从源码提取 ${added} 张无水印原图`)
+    dialog.info({
+      title: '提取完成',
+      content: `共 ${added} 张图片。是否立即开始去水印？`,
+      positiveText: '开始去水印',
+      negativeText: '暂不',
+      onPositiveClick: () => {
+        void onStartProcess()
+      }
+    })
+  } finally {
+    parsingHtml.value = false
+  }
 }
 
 async function onPasteAndFill() {
@@ -856,12 +927,14 @@ function bindProgressObserver(el: HTMLElement | null) {
 }
 
 function resolveActiveProgressPanel() {
-  if (fetchingLinks.value && linkProgressPanelRef.value) return linkProgressPanelRef.value
+  if ((fetchingLinks.value || parsingHtml.value) && linkProgressPanelRef.value) {
+    return linkProgressPanelRef.value
+  }
   if (processing.value && processProgressPanelRef.value) return processProgressPanelRef.value
   return processProgressPanelRef.value || linkProgressPanelRef.value
 }
 
-watch([linkProgressPanelRef, processProgressPanelRef, fetchingLinks, processing], () => {
+watch([linkProgressPanelRef, processProgressPanelRef, fetchingLinks, parsingHtml, processing], () => {
   bindProgressObserver(resolveActiveProgressPanel())
 })
 
@@ -886,14 +959,41 @@ onUnmounted(() => {
       <header class="hero">
         <h1 class="headline">上传文件或粘贴 AI 聊天链接，自动识别并去除水印</h1>
         <p class="sub">
-          支持豆包等分享链接批量拉图；也可本地上传图片 / zip / 短视频。图片与链接走同一去水印流水线；一次只能选一种类型。
+          推荐粘贴豆包网页源码在本地提取无水印原图；也支持分享链接云端拉图，或上传图片 / zip / 短视频。一次只能选一种类型。
         </p>
       </header>
 
       <section class="panel">
         <div class="panel-head">
+          <label class="label" for="html-source-input">粘贴网页源码（推荐 · 不经后端）</label>
+          <span class="hint-inline">打开豆包 → 右键「查看网页源代码」→ Ctrl+A 复制</span>
+        </div>
+        <NInput
+          id="html-source-input"
+          v-model:value="htmlDraft"
+          type="textarea"
+          :autosize="{ minRows: 4, maxRows: 12 }"
+          placeholder="在此粘贴完整 HTML 源码，将优先提取 image_ori_raw 无水印原图…"
+          :disabled="busy"
+        />
+        <div class="actions">
+          <NButton quaternary :disabled="busy || !htmlDraft.trim()" @click="htmlDraft = ''">清空源码</NButton>
+          <NButton
+            type="primary"
+            size="large"
+            :loading="parsingHtml"
+            :disabled="busy || !hasHtmlDraft"
+            @click="onParseHtmlDraft"
+          >
+            从源码提取原图
+          </NButton>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
           <label class="label" for="ai-link-input">粘贴 AI 聊天链接</label>
-          <span class="hint-inline">每行一条 · 最多 {{ MAX_LINK_QUEUE }} 条 · Ctrl/⌘ + Enter 拉取</span>
+          <span class="hint-inline">云端拉取 · 每行一条 · 最多 {{ MAX_LINK_QUEUE }} 条</span>
         </div>
         <NInput
           id="ai-link-input"
@@ -1005,15 +1105,15 @@ onUnmounted(() => {
         </p>
       </section>
 
-      <section v-if="fetchingLinks || linkProgressTotal" ref="linkProgressPanelRef" class="panel">
+      <section v-if="fetchingLinks || parsingHtml || linkProgressTotal" ref="linkProgressPanelRef" class="panel">
         <div class="panel-head">
-          <p class="label">拉图进度</p>
+          <p class="label">{{ parsingHtml ? '源码提取进度' : '拉图进度' }}</p>
           <span class="hint-inline">{{ linkProgressDone }} / {{ linkProgressTotal }}</span>
         </div>
         <NProgress
           type="line"
           :percentage="linkPercent"
-          :processing="fetchingLinks"
+          :processing="fetchingLinks || parsingHtml"
           :show-indicator="true"
         />
       </section>

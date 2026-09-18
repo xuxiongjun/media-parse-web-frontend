@@ -69,12 +69,18 @@ export function isFetchRateLimited(err: unknown): boolean {
 
 /** 通过代理 URL 拉取图片并转为 File，供去水印任务使用 */
 export async function proxyUrlToFile(proxyUrl: string, filename: string): Promise<File> {
+  return downloadImageUrlToFile(proxyUrl, filename)
+}
+
+/** 直链下载图片（CDN / 源码提取的 image_ori_raw），不经后端 */
+export async function downloadImageUrlToFile(url: string, filename: string): Promise<File> {
   const controller = new AbortController()
   const timer = window.setTimeout(() => controller.abort(), MEDIA_DOWNLOAD_TIMEOUT_MS)
   try {
-    const res = await fetch(proxyUrl, {
+    const res = await fetch(url, {
       credentials: 'omit',
       cache: 'no-store',
+      mode: 'cors',
       signal: controller.signal
     })
     if (!res.ok) {
@@ -93,6 +99,9 @@ export async function proxyUrlToFile(proxyUrl: string, filename: string): Promis
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') {
       throw new Error('下载图片超时，请稍后重试')
+    }
+    if (err instanceof TypeError) {
+      throw new Error('浏览器无法直连图床（跨域限制），请改用本地保存后上传')
     }
     throw err
   } finally {
