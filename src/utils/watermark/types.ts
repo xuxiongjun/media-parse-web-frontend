@@ -14,6 +14,8 @@ export interface WatermarkTask {
   resultBlob: Blob | null
   maskPreviewUrl: string | null
   regionLabel: string | null
+  /** 源码提取的无水印原图，无需再跑去水印，可直接下载 */
+  readyAsOriginal?: boolean
 }
 
 export interface WatermarkBox {

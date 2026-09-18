@@ -96,6 +96,12 @@ function nextLinkId() {
 
 const hasTasks = computed(() => tasks.value.length > 0)
 const doneCount = computed(() => tasks.value.filter((t) => t.status === 'done').length)
+const pendingProcessCount = computed(() =>
+  tasks.value.filter((t) => t.status === 'pending' || t.status === 'error').length
+)
+const allReadyAsOriginal = computed(
+  () => hasTasks.value && tasks.value.every((t) => t.readyAsOriginal && t.status === 'done')
+)
 const failCount = computed(() => tasks.value.filter((t) => t.status === 'error').length)
 const hasDraft = computed(() => draft.value.trim().length > 0)
 const hasLinkQueue = computed(() => linkQueue.value.length > 0)
@@ -161,7 +167,7 @@ const modeHint = computed(() => {
 
 function revokeTaskUrls(task: WatermarkTask) {
   if (task.originalUrl) URL.revokeObjectURL(task.originalUrl)
-  if (task.resultUrl) URL.revokeObjectURL(task.resultUrl)
+  if (task.resultUrl && task.resultUrl !== task.originalUrl) URL.revokeObjectURL(task.resultUrl)
   if (task.maskPreviewUrl?.startsWith('blob:')) URL.revokeObjectURL(task.maskPreviewUrl)
 }
 
@@ -215,8 +221,12 @@ function ensureImagesModeForLinks(): boolean {
   return true
 }
 
-function addImageTask(file: File, options?: { fromZip?: boolean }): boolean {
+function addImageTask(
+  file: File,
+  options?: { fromZip?: boolean; readyAsOriginal?: boolean }
+): boolean {
   const fromZip = options?.fromZip === true
+  const readyAsOriginal = options?.readyAsOriginal === true
   if (!fromZip && file.size > MAX_IMAGE_BYTES) {
     message.error(`${file.name} 超过单张大小限制`)
     return false
@@ -229,18 +239,20 @@ function addImageTask(file: File, options?: { fromZip?: boolean }): boolean {
     message.warning(`最多 ${MAX_IMAGES} 张图片`)
     return false
   }
+  const previewUrl = URL.createObjectURL(file)
   tasks.value.push({
     id: nextId(),
     name: file.name,
     kind: 'image',
     sourceFile: file,
-    status: 'pending',
+    status: readyAsOriginal ? 'done' : 'pending',
     error: null,
-    originalUrl: URL.createObjectURL(file),
-    resultUrl: null,
-    resultBlob: null,
+    originalUrl: previewUrl,
+    resultUrl: readyAsOriginal ? previewUrl : null,
+    resultBlob: readyAsOriginal ? file : null,
     maskPreviewUrl: null,
-    regionLabel: null
+    regionLabel: readyAsOriginal ? '源码无水印原图' : null,
+    readyAsOriginal
   })
   return true
 }
@@ -407,7 +419,7 @@ async function onParseHtmlDraft() {
       const filename = `${titleBase}_${i + 1}`
       try {
         const file = await downloadImageUrlToFile(extracted.urls[i], filename)
-        if (addImageTask(file)) added += 1
+        if (addImageTask(file, { readyAsOriginal: true })) added += 1
       } catch (err) {
         const msg = err instanceof Error ? err.message : '下载失败'
         message.warning(`${filename}：${msg}`)
@@ -421,11 +433,11 @@ async function onParseHtmlDraft() {
     message.success(`已从源码提取 ${added} 张无水印原图`)
     dialog.info({
       title: '提取完成',
-      content: `共 ${added} 张图片。是否立即开始去水印？`,
-      positiveText: '开始去水印',
+      content: `已得到 ${added} 张无水印原图，是否直接下载全部？`,
+      positiveText: '下载全部',
       negativeText: '暂不',
       onPositiveClick: () => {
-        void onStartProcess()
+        void downloadAll()
       }
     })
   } finally {
@@ -775,6 +787,7 @@ function downloadExt(task: WatermarkTask) {
 }
 
 function resultFilename(task: WatermarkTask) {
+  if (task.readyAsOriginal) return task.name
   const base = task.name.replace(/\.[^.]+$/, '') || 'result'
   return `${base}-nowm.${downloadExt(task)}`
 }
@@ -901,7 +914,12 @@ async function downloadAll() {
 function statusTag(task: WatermarkTask) {
   if (task.status === 'pending') return { type: 'default' as const, label: '待处理' }
   if (task.status === 'processing') return { type: 'info' as const, label: '处理中' }
-  if (task.status === 'done') return { type: 'success' as const, label: '完成' }
+  if (task.status === 'done') {
+    return {
+      type: 'success' as const,
+      label: task.readyAsOriginal ? '无水印原图' : '完成'
+    }
+  }
   return { type: 'error' as const, label: '失败' }
 }
 
@@ -1162,13 +1180,24 @@ onUnmounted(() => {
           <NButton quaternary :disabled="busy || !hasTasks" @click="clearTasks">清空任务</NButton>
           <NButton secondary :disabled="busy" @click="openPicker">继续添加</NButton>
           <NButton
+            v-if="pendingProcessCount > 0"
             type="primary"
             size="large"
             :loading="processing"
-            :disabled="busy || !hasTasks"
+            :disabled="busy"
             @click="onStartProcess"
           >
             开始去水印
+          </NButton>
+          <NButton
+            v-else-if="doneCount > 0"
+            type="primary"
+            size="large"
+            :loading="downloadingAll"
+            :disabled="busy || downloadingAll"
+            @click="downloadAll"
+          >
+            下载全部{{ allReadyAsOriginal ? '原图' : '结果' }}（{{ doneCount }}）
           </NButton>
         </div>
       </section>
@@ -1186,7 +1215,9 @@ onUnmounted(() => {
 
       <section v-if="hasTasks" class="panel">
         <div class="panel-head">
-          <p class="label">任务列表（{{ tasks.length }}）</p>
+          <p class="label">
+            {{ allReadyAsOriginal ? `提取结果（${tasks.length}）` : `任务列表（${tasks.length}）` }}
+          </p>
           <NButton
             size="tiny"
             secondary
@@ -1197,7 +1228,10 @@ onUnmounted(() => {
             <template v-if="downloadingAll && downloadSaveTotal">
               保存中 {{ downloadSaveDone }}/{{ downloadSaveTotal }}
             </template>
-            <template v-else>下载全部结果{{ doneCount ? `（${doneCount}）` : '' }}</template>
+            <template v-else>
+              下载全部{{ allReadyAsOriginal ? '原图' : '结果'
+              }}{{ doneCount ? `（${doneCount}）` : '' }}
+            </template>
           </NButton>
         </div>
         <p v-if="downloadingAll && downloadSaveLabel" class="download-current">
@@ -1213,42 +1247,58 @@ onUnmounted(() => {
               <p class="task-name">{{ task.name }}</p>
               <NTag size="small" :type="statusTag(task).type">{{ statusTag(task).label }}</NTag>
             </div>
-            <p v-if="task.regionLabel" class="task-meta">检测位置：{{ task.regionLabel }}</p>
+            <p v-if="task.regionLabel && !task.readyAsOriginal" class="task-meta">
+              检测位置：{{ task.regionLabel }}
+            </p>
+            <p v-else-if="task.readyAsOriginal" class="task-meta">已从源码提取，可直接下载</p>
 
             <p v-if="task.error" class="task-error">{{ task.error }}</p>
 
             <div v-if="task.originalUrl || task.resultUrl" class="compare-grid">
-              <div v-if="task.originalUrl" class="compare-item">
-                <p class="compare-label">原图（点击预览）</p>
-                <NImage
-                  v-if="task.kind === 'image'"
-                  :src="task.originalUrl"
-                  object-fit="contain"
-                  class="preview-image"
-                  :img-props="{ alt: '原图' }"
-                />
-                <video v-else :src="task.originalUrl" controls class="preview" />
-              </div>
-              <div v-if="task.resultUrl" class="compare-item">
-                <p class="compare-label">去水印后（点这里看结果）</p>
-                <NImage
-                  v-if="task.kind === 'image'"
-                  :src="task.resultUrl"
-                  object-fit="contain"
-                  class="preview-image"
-                  :img-props="{ alt: '去水印后' }"
-                />
-                <video v-else :src="task.resultUrl" controls class="preview" />
-              </div>
-              <div v-if="task.maskPreviewUrl" class="compare-item">
-                <p class="compare-label">检测区域（点击预览）</p>
-                <NImage
-                  :src="task.maskPreviewUrl"
-                  object-fit="contain"
-                  class="preview-image"
-                  :img-props="{ alt: '水印检测区域' }"
-                />
-              </div>
+              <template v-if="task.readyAsOriginal && task.originalUrl">
+                <div class="compare-item compare-item-single">
+                  <p class="compare-label">无水印原图（点击预览）</p>
+                  <NImage
+                    :src="task.originalUrl"
+                    object-fit="contain"
+                    class="preview-image"
+                    :img-props="{ alt: '无水印原图' }"
+                  />
+                </div>
+              </template>
+              <template v-else>
+                <div v-if="task.originalUrl" class="compare-item">
+                  <p class="compare-label">原图（点击预览）</p>
+                  <NImage
+                    v-if="task.kind === 'image'"
+                    :src="task.originalUrl"
+                    object-fit="contain"
+                    class="preview-image"
+                    :img-props="{ alt: '原图' }"
+                  />
+                  <video v-else :src="task.originalUrl" controls class="preview" />
+                </div>
+                <div v-if="task.resultUrl" class="compare-item">
+                  <p class="compare-label">去水印后（点这里看结果）</p>
+                  <NImage
+                    v-if="task.kind === 'image'"
+                    :src="task.resultUrl"
+                    object-fit="contain"
+                    class="preview-image"
+                    :img-props="{ alt: '去水印后' }"
+                  />
+                  <video v-else :src="task.resultUrl" controls class="preview" />
+                </div>
+                <div v-if="task.maskPreviewUrl" class="compare-item">
+                  <p class="compare-label">检测区域（点击预览）</p>
+                  <NImage
+                    :src="task.maskPreviewUrl"
+                    object-fit="contain"
+                    class="preview-image"
+                    :img-props="{ alt: '水印检测区域' }"
+                  />
+                </div>
+              </template>
             </div>
 
             <div class="task-actions">
@@ -1259,7 +1309,7 @@ onUnmounted(() => {
                 :disabled="downloadingAll"
                 @click="downloadTask(task)"
               >
-                下载结果
+                {{ task.readyAsOriginal ? '下载原图' : '下载结果' }}
               </NButton>
             </div>
           </article>
@@ -1464,6 +1514,10 @@ onUnmounted(() => {
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 10px;
   margin-top: 12px;
+}
+
+.compare-item-single {
+  max-width: 360px;
 }
 
 .compare-label {
