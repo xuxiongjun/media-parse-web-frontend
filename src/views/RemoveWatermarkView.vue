@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { NButton, NImage, NInput, NProgress, NTag, useDialog, useMessage } from 'naive-ui'
 import AppNav from '../components/AppNav.vue'
 import {
@@ -65,6 +65,13 @@ const downloadSaveTotal = ref(0)
 const downloadSaveLabel = ref('')
 const downloadSaveFailHint = ref('')
 
+const progressPanelRef = ref<HTMLElement | null>(null)
+const linkProgressPanelRef = ref<HTMLElement | null>(null)
+const processProgressPanelRef = ref<HTMLElement | null>(null)
+const progressPanelInView = ref(true)
+const showBackTop = ref(false)
+let progressObserver: IntersectionObserver | null = null
+
 const MAX_LINK_QUEUE = 99
 const BATCH_CONCURRENCY = 3
 const BATCH_GAP_MS = 280
@@ -92,6 +99,33 @@ const linkQueueAtLimit = computed(() => linkQueue.value.length >= MAX_LINK_QUEUE
 const linkFailCount = computed(() => linkQueue.value.filter((i) => i.status === 'error').length)
 const linkSuccessCount = computed(() => linkQueue.value.filter((i) => i.status === 'done').length)
 const busy = computed(() => processing.value || fetchingLinks.value)
+
+const processPercent = computed(() => {
+  if (!progressTotal.value) return 0
+  return Math.min(
+    100,
+    Math.round(((progressDone.value + fileProgress.value / 100) / progressTotal.value) * 100)
+  )
+})
+
+const linkPercent = computed(() => {
+  if (!linkProgressTotal.value) return 0
+  return Math.min(100, Math.round((linkProgressDone.value / linkProgressTotal.value) * 100))
+})
+
+/** 浮动环形进度：拉图或去水印进行中时取当前活动进度 */
+const floatingPercent = computed(() => {
+  if (fetchingLinks.value && linkProgressTotal.value > 0) return linkPercent.value
+  if (processing.value && progressTotal.value > 0) return processPercent.value
+  return 0
+})
+
+const showFloatingProgress = computed(
+  () =>
+    ((fetchingLinks.value && linkProgressTotal.value > 0) ||
+      (processing.value && progressTotal.value > 0)) &&
+    !progressPanelInView.value
+)
 
 const acceptAttr = computed(() => {
   if (uploadMode.value === 'zip') return '.zip'
@@ -744,7 +778,61 @@ function statusTag(task: WatermarkTask) {
   return { type: 'error' as const, label: '失败' }
 }
 
-onUnmounted(() => clearAll())
+function onWindowScroll() {
+  showBackTop.value = window.scrollY > 360
+}
+
+function scrollToTop() {
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+function scrollToProgress() {
+  const el =
+    (fetchingLinks.value && linkProgressPanelRef.value) ||
+    (processing.value && processProgressPanelRef.value) ||
+    processProgressPanelRef.value ||
+    linkProgressPanelRef.value
+  el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
+function bindProgressObserver(el: HTMLElement | null) {
+  progressObserver?.disconnect()
+  progressObserver = null
+  progressPanelRef.value = el
+  if (!el) {
+    progressPanelInView.value = true
+    return
+  }
+  progressObserver = new IntersectionObserver(
+    ([entry]) => {
+      progressPanelInView.value = entry.isIntersecting
+    },
+    { threshold: 0.15, rootMargin: '0px' }
+  )
+  progressObserver.observe(el)
+}
+
+function resolveActiveProgressPanel() {
+  if (fetchingLinks.value && linkProgressPanelRef.value) return linkProgressPanelRef.value
+  if (processing.value && processProgressPanelRef.value) return processProgressPanelRef.value
+  return processProgressPanelRef.value || linkProgressPanelRef.value
+}
+
+watch([linkProgressPanelRef, processProgressPanelRef, fetchingLinks, processing], () => {
+  bindProgressObserver(resolveActiveProgressPanel())
+})
+
+onMounted(() => {
+  window.addEventListener('scroll', onWindowScroll, { passive: true })
+  onWindowScroll()
+})
+
+onUnmounted(() => {
+  window.removeEventListener('scroll', onWindowScroll)
+  progressObserver?.disconnect()
+  progressObserver = null
+  clearAll()
+})
 </script>
 
 <template>
@@ -874,18 +962,14 @@ onUnmounted(() => clearAll())
         </p>
       </section>
 
-      <section v-if="fetchingLinks || linkProgressTotal" class="panel">
+      <section v-if="fetchingLinks || linkProgressTotal" ref="linkProgressPanelRef" class="panel">
         <div class="panel-head">
           <p class="label">拉图进度</p>
           <span class="hint-inline">{{ linkProgressDone }} / {{ linkProgressTotal }}</span>
         </div>
         <NProgress
           type="line"
-          :percentage="
-            linkProgressTotal
-              ? Math.min(100, Math.round((linkProgressDone / linkProgressTotal) * 100))
-              : 0
-          "
+          :percentage="linkPercent"
           :processing="fetchingLinks"
           :show-indicator="true"
         />
@@ -926,7 +1010,7 @@ onUnmounted(() => clearAll())
         </div>
       </section>
 
-      <section v-if="processing || progressTotal" class="panel">
+      <section v-if="processing || progressTotal" ref="processProgressPanelRef" class="panel">
         <div class="panel-head">
           <p class="label">处理进度</p>
           <span class="hint-inline">
@@ -934,18 +1018,7 @@ onUnmounted(() => clearAll())
             <template v-if="progressPhase"> · {{ progressPhase }}</template>
           </span>
         </div>
-        <NProgress
-          type="line"
-          :percentage="
-            progressTotal
-              ? Math.min(
-                  100,
-                  Math.round(((progressDone + fileProgress / 100) / progressTotal) * 100)
-                )
-              : 0
-          "
-          :show-indicator="true"
-        />
+        <NProgress type="line" :percentage="processPercent" :show-indicator="true" />
       </section>
 
       <section v-if="hasTasks" class="panel">
@@ -1030,6 +1103,34 @@ onUnmounted(() => clearAll())
         </div>
       </section>
     </main>
+
+    <div class="fab-stack">
+      <button
+        v-show="showFloatingProgress"
+        type="button"
+        class="parse-progress-fab"
+        :aria-label="`进度 ${floatingPercent}%，点击跳转到进度条`"
+        @click="scrollToProgress"
+      >
+        <NProgress
+          type="circle"
+          :percentage="floatingPercent"
+          :processing="busy"
+          :stroke-width="8"
+          :show-indicator="true"
+          class="parse-progress-ring"
+        />
+      </button>
+      <button
+        v-show="showBackTop"
+        type="button"
+        class="back-top"
+        aria-label="回到顶部"
+        @click="scrollToTop"
+      >
+        ↑
+      </button>
+    </div>
   </div>
 </template>
 
@@ -1250,7 +1351,97 @@ onUnmounted(() => clearAll())
   color: var(--danger);
 }
 
+.fab-stack {
+  position: fixed;
+  right: 56px;
+  bottom: 28px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.parse-progress-fab {
+  width: 58px;
+  height: 58px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: rgba(16, 32, 28, 0.92);
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+  display: grid;
+  place-items: center;
+  transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.parse-progress-fab:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  transform: translateY(-2px);
+}
+
+.parse-progress-fab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.parse-progress-ring {
+  width: 46px !important;
+}
+
+.parse-progress-ring :deep(.n-progress-text) {
+  font-size: 0.68rem !important;
+  color: var(--accent) !important;
+}
+
+.back-top {
+  width: 58px;
+  height: 58px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(16, 32, 28, 0.92);
+  color: var(--accent);
+  font-size: 1.45rem;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+  transition: color 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+}
+
+.back-top:hover {
+  color: #45e0b6;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  transform: translateY(-2px);
+}
+
+.back-top:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 @media (max-width: 640px) {
+  .fab-stack {
+    right: 36px;
+    bottom: 22px;
+  }
+
+  .parse-progress-fab,
+  .back-top {
+    width: 52px;
+    height: 52px;
+  }
+
+  .parse-progress-ring {
+    width: 40px !important;
+  }
+
+  .back-top {
+    font-size: 1.3rem;
+  }
+
   .queue-row {
     grid-template-columns: 28px 1fr;
     grid-template-areas:
