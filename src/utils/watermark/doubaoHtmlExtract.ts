@@ -12,7 +12,24 @@ const LOOSE_RAW_URL =
   /https?:\/\/[a-z0-9.-]*(?:byteimg|ivolces|doubao)[^\s"'<>\\]{10,1200}/gi
 const IMAGE_ID = /rc_gen_image\/([a-f0-9]{32})/i
 const SHARE_NAME = /"share_name"\s*:\s*"([^"]{1,120})"/i
+/** 对话页 SSR：conversationInfo / conversation 上的会话名 */
+const CONVERSATION_INFO_NAME =
+  /"conversationInfo"\s*:\s*\{[\s\S]{0,2000}?"name"\s*:\s*"((?:\\.|[^"\\]){1,120})"/i
+const CONVERSATION_NAME =
+  /"conversation"\s*:\s*\{[\s\S]{0,600}?"name"\s*:\s*"((?:\\.|[^"\\]){1,120})"/i
+const GENERIC_TITLES = new Set(['豆包', '豆包源码', 'doubao', 'doubao源码'])
 const UNICODE_ESCAPE = /\\u([0-9a-fA-F]{4})/g
+
+/** 解码 JS/JSON 字符串片段中的 \\uXXXX、\\\"、\\\\ 等转义 */
+function decodeJsString(s: string): string {
+  return s
+    .replace(UNICODE_ESCAPE, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\')
+}
 
 export interface DoubaoHtmlExtractResult {
   urls: string[]
@@ -202,12 +219,33 @@ function isLikelyThumb(url: string): boolean {
   )
 }
 
-function extractTitle(html: string): string | null {
-  const m = SHARE_NAME.exec(html)
+function isUsableTitle(raw: string | null | undefined): raw is string {
+  if (!raw) return false
+  const t = raw.trim()
+  if (!t) return false
+  return !GENERIC_TITLES.has(t.toLowerCase()) && !GENERIC_TITLES.has(t)
+}
+
+function pickTitle(html: string, re: RegExp): string | null {
+  const m = re.exec(html)
   if (!m?.[1]) return null
+  let decoded: string
   try {
-    return JSON.parse(`"${m[1]}"`) as string
+    decoded = JSON.parse(`"${m[1]}"`) as string
   } catch {
-    return m[1]
+    decoded = decodeJsString(m[1])
   }
+  return isUsableTitle(decoded) ? decoded.trim() : null
+}
+
+/**
+ * 对话页 SSR 里会话名在 conversationInfo.name / conversation.name；
+ * 分享页才有 share_name。og:title 固定是「豆包」，不能当标题。
+ */
+function extractTitle(html: string): string | null {
+  return (
+    pickTitle(html, CONVERSATION_INFO_NAME) ||
+    pickTitle(html, CONVERSATION_NAME) ||
+    pickTitle(html, SHARE_NAME)
+  )
 }

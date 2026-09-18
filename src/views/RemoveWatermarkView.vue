@@ -402,7 +402,7 @@ async function onAppendHtmlFromClipboard() {
       htmlDraft.value = `${prev}${sep}${chunk}`
     }
     const n = splitHtmlDocuments(htmlDraft.value).length
-    message.success(n > 1 ? `已追加，当前共 ${n} 段源码` : '已从剪贴板追加')
+    message.success(n > 1 ? `已追加，当前共 ${n} 段源码` : '已从剪贴板追加 并自动换行')
   } catch {
     message.error('无法读取剪贴板，请手动粘贴到输入框')
   }
@@ -441,7 +441,7 @@ async function onParseHtmlDraft() {
     for (let d = 0; d < batch.docs.length; d++) {
       const doc = batch.docs[d]
       if (!doc.urls.length) continue
-      const groupTitle = (doc.title || (batch.docCount > 1 ? `豆包源码${d + 1}` : '豆包源码')).trim()
+      const groupTitle = (doc.title || (batch.docCount > 1 ? `未命名对话${d + 1}` : '未命名对话')).trim()
       const titleBase = groupTitle.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 40)
       let localIdx = 0
       for (const url of doc.urls) {
@@ -1059,7 +1059,7 @@ onUnmounted(() => {
         />
         <div class="actions">
           <NButton quaternary :disabled="busy || !htmlDraft.trim()" @click="htmlDraft = ''">清空源码</NButton>
-          <NButton secondary :disabled="busy" @click="onAppendHtmlFromClipboard">从剪贴板追加</NButton>
+          <NButton secondary :disabled="busy" @click="onAppendHtmlFromClipboard">从剪贴板追加 并自动换行</NButton>
           <NButton
             type="primary"
             size="large"
@@ -1093,7 +1093,7 @@ onUnmounted(() => {
           <NButton secondary :disabled="busy || !hasDraft" @click="syncQueueFromDraft">
             整理到列表
           </NButton>
-          <NButton secondary :disabled="busy" @click="onPasteAndFill">从剪贴板追加</NButton>
+          <NButton secondary :disabled="busy" @click="onPasteAndFill">从剪贴板追加 并自动换行</NButton>
           <NButton
             type="primary"
             size="large"
