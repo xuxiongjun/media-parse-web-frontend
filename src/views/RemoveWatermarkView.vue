@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { NButton, NImage, NInput, NProgress, NTag, useDialog, useMessage } from 'naive-ui'
+import type { ImageInst } from 'naive-ui'
+import { NButton, NImage, NImageGroup, NInput, NProgress, NTag, useDialog, useMessage } from 'naive-ui'
 import AppNav from '../components/AppNav.vue'
 import {
   canUseDirectoryPicker,
@@ -78,6 +79,20 @@ let progressObserver: IntersectionObserver | null = null
 
 const MAX_LINK_QUEUE = 99
 const BATCH_CONCURRENCY = 3
+
+/** 豆包「查看网页源代码」操作示意 */
+const HTML_HELP_IMAGES = [
+  { src: '/help/doubao-source-1.png', alt: '步骤1：右键查看网页源代码' },
+  { src: '/help/doubao-source-2.png', alt: '步骤2：Ctrl+A 全选源码' },
+  { src: '/help/doubao-source-3.png', alt: '步骤3：粘贴后点击提取原图' }
+] as const
+
+const htmlHelpFirstImageRef = ref<ImageInst | null>(null)
+
+function openHtmlSourceHelp() {
+  htmlHelpFirstImageRef.value?.showPreview()
+}
+
 const BATCH_GAP_MS = 280
 const RATE_LIMIT_BACKOFF_MS = 3500
 const RATE_LIMIT_MAX_RETRY = 2
@@ -1044,10 +1059,34 @@ onUnmounted(() => {
       <section class="panel">
         <div class="panel-head">
           <label class="label" for="html-source-input">粘贴网页源码（推荐 · 不经后端）</label>
-          <span class="hint-inline">
+          <span class="hint-inline hint-with-help">
             打开豆包 → 右键「查看网页源代码」→ Ctrl+A 复制
+            <button
+              type="button"
+              class="hint-help-btn"
+              title="查看操作示意"
+              aria-label="查看操作示意"
+              @click="openHtmlSourceHelp"
+            >
+              ?
+            </button>
             <template v-if="htmlDocCount > 1"> · 已识别 {{ htmlDocCount }} 段</template>
           </span>
+          <div class="html-help-preview-host" aria-hidden="true">
+            <NImageGroup>
+              <NImage
+                ref="htmlHelpFirstImageRef"
+                :src="HTML_HELP_IMAGES[0].src"
+                :img-props="{ alt: HTML_HELP_IMAGES[0].alt }"
+              />
+              <NImage
+                v-for="item in HTML_HELP_IMAGES.slice(1)"
+                :key="item.src"
+                :src="item.src"
+                :img-props="{ alt: item.alt }"
+              />
+            </NImageGroup>
+          </div>
         </div>
         <NInput
           id="html-source-input"
@@ -1396,6 +1435,45 @@ onUnmounted(() => {
 
 .hidden-input {
   display: none;
+}
+
+.hint-with-help {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.hint-help-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(148, 163, 184, 0.55);
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.hint-help-btn:hover {
+  border-color: rgba(45, 212, 168, 0.75);
+  color: var(--accent);
+}
+
+.html-help-preview-host {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .upload-zone {
