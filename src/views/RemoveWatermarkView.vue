@@ -529,7 +529,6 @@ async function onBatchFetchLinks() {
     const bad = linkFailCount.value
     const imgTotal = linkQueue.value.reduce((n, i) => n + (i.imageCount || 0), 0)
     if (ok && !bad) {
-      message.success(`已拉取 ${imgTotal} 张图片到任务列表，可开始去水印`)
       dialog.info({
         title: '拉取完成',
         content: `成功 ${ok} 条链接，共 ${imgTotal} 张图片。是否立即开始去水印？`,
@@ -540,7 +539,15 @@ async function onBatchFetchLinks() {
         }
       })
     } else if (ok && bad) {
-      message.warning(`完成：成功 ${ok}（${imgTotal} 张图），失败 ${bad}`)
+      dialog.info({
+        title: '拉取完成',
+        content: `成功 ${ok} 条（${imgTotal} 张图），失败 ${bad}。是否对已成功的图片开始去水印？`,
+        positiveText: '开始去水印',
+        negativeText: '稍后',
+        onPositiveClick: () => {
+          void onStartProcess()
+        }
+      })
     } else {
       message.error(`全部失败（${bad}）`)
     }
@@ -636,8 +643,44 @@ async function onStartProcess() {
   }
   processing.value = false
   progressPhase.value = ''
-  if (failCount.value) message.warning(`完成：成功 ${doneCount.value}，失败 ${failCount.value}`)
-  else message.success(`全部处理完成（${doneCount.value}）`)
+
+  const ok = doneCount.value
+  const bad = failCount.value
+  const savable = tasks.value.filter((t) => t.status === 'done' && t.resultBlob).length
+
+  if (ok && !bad) {
+    dialog.info({
+      title: '去水印完成',
+      content: '图片已经全部处理完成，是否保存全部？',
+      positiveText: '保存全部',
+      negativeText: '暂不',
+      onPositiveClick: () => {
+        void downloadAll()
+      }
+    })
+  } else if (ok && bad) {
+    dialog.info({
+      title: '去水印完成',
+      content: `完成：成功 ${ok}，失败 ${bad}。是否保存已成功的结果？`,
+      positiveText: '保存全部',
+      negativeText: '暂不',
+      onPositiveClick: () => {
+        void downloadAll()
+      }
+    })
+  } else if (savable) {
+    dialog.info({
+      title: '去水印完成',
+      content: `本轮无新增成功项，当前仍有 ${savable} 个可保存结果。是否保存？`,
+      positiveText: '保存全部',
+      negativeText: '暂不',
+      onPositiveClick: () => {
+        void downloadAll()
+      }
+    })
+  } else {
+    message.error(`全部失败（${bad}）`)
+  }
 }
 
 function downloadExt(task: WatermarkTask) {
