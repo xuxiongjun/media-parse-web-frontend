@@ -14,8 +14,10 @@ export interface WatermarkTask {
   resultBlob: Blob | null
   maskPreviewUrl: string | null
   regionLabel: string | null
-  /** 源码提取的无水印原图，无需再跑去水印，可直接下载 */
+  /** 源码提取后可直接下载，无需再跑本地去水印 */
   readyAsOriginal?: boolean
+  /** 源码视频是否已确认与带水印档不是同一文件。原图默认视为干净。 */
+  cleanSource?: boolean
 }
 
 export interface WatermarkBox {

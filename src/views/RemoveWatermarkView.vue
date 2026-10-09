@@ -11,6 +11,7 @@ import {
 import {
   collectShareEntries,
   downloadImageUrlToFile,
+  downloadVideoUrlToFile,
   extractFirstUrl,
   fetchChatImages,
   fetchImagesErrorMessage,
@@ -20,6 +21,7 @@ import {
   type FetchImagesResult
 } from '../api/watermarkFetch'
 import { extractDoubaoFromHtmlBatch, splitHtmlDocuments } from '../utils/watermark/doubaoHtmlExtract'
+import { isDifferentMedia, resolveDoubaoUnwatermarked } from '../utils/watermark/doubaoFplay'
 import {
   isImageName,
   isVideoName,
@@ -63,6 +65,7 @@ const fetchingLinks = ref(false)
 const linkProgressDone = ref(0)
 const linkProgressTotal = ref(0)
 const parsingHtml = ref(false)
+const htmlProgressLabel = ref('')
 
 const downloadingAll = ref(false)
 const downloadSaveDone = ref(0)
@@ -117,6 +120,13 @@ const pendingProcessCount = computed(() =>
 const allReadyAsOriginal = computed(
   () => hasTasks.value && tasks.value.every((t) => t.readyAsOriginal && t.status === 'done')
 )
+const readyDownloadNoun = computed(() => {
+  if (!allReadyAsOriginal.value) return '结果'
+  const kinds = new Set(tasks.value.map((t) => t.kind))
+  if (kinds.size === 1 && kinds.has('video')) return '原视频'
+  if (kinds.size === 1 && kinds.has('image')) return '原图'
+  return '原文件'
+})
 const failCount = computed(() => tasks.value.filter((t) => t.status === 'error').length)
 const hasDraft = computed(() => draft.value.trim().length > 0)
 const hasLinkQueue = computed(() => linkQueue.value.length > 0)
@@ -178,7 +188,7 @@ const modeHint = computed(() => {
   if (!uploadMode.value) {
     return showAiLinkFetch.value
       ? '一次仅选一种类型：多张图片 / 单个 zip / 单个视频；也可粘贴 AI 聊天链接拉图'
-      : '一次仅选一种类型：多张图片 / 单个 zip / 单个视频；也可粘贴网页源码提取原图'
+      : '一次仅选一种类型：多张图片 / 单个 zip / 单个视频；也可粘贴网页源码提取原图和原视频'
   }
   if (uploadMode.value === 'images') return `已选图片模式 · 最多 ${MAX_IMAGES} 张 · 单张 ≤ ${MAX_IMAGE_BYTES / 1024 / 1024}MB`
   if (uploadMode.value === 'zip') return '已选 zip 模式 · 仅 1 个压缩包 · 内含图片数量不限制'
@@ -272,7 +282,32 @@ function addImageTask(
     resultBlob: readyAsOriginal ? file : null,
     maskPreviewUrl: null,
     regionLabel: readyAsOriginal ? '源码无水印原图' : null,
-    readyAsOriginal
+    readyAsOriginal,
+    cleanSource: readyAsOriginal ? true : undefined
+  })
+  return true
+}
+
+function addReadyVideoTask(file: File, clean: boolean): boolean {
+  if (file.size > MAX_VIDEO_BYTES) {
+    message.error(`${file.name} 超过视频大小限制`)
+    return false
+  }
+  const previewUrl = URL.createObjectURL(file)
+  tasks.value.push({
+    id: nextId(),
+    name: file.name,
+    kind: 'video',
+    sourceFile: file,
+    status: 'done',
+    error: null,
+    originalUrl: previewUrl,
+    resultUrl: previewUrl,
+    resultBlob: file,
+    maskPreviewUrl: null,
+    regionLabel: clean ? '源码无水印原视频' : '源码视频（含水印）',
+    readyAsOriginal: true,
+    cleanSource: clean
   })
   return true
 }
@@ -436,31 +471,35 @@ async function onParseHtmlDraft() {
   if (busy.value) return
 
   const batch = extractDoubaoFromHtmlBatch(html)
-  if (!batch.urls.length) {
+  if (!batch.urls.length && !batch.videos.length) {
     const hasShare = /share_info|share_name|message_snapshot/i.test(html)
     message.error(
       hasShare
-        ? '源码里有分享数据，但未解析到图片链接。请用 Ctrl+A 全选整页源码再复制（图片数据通常在页面最底部）。'
-        : '源码中未找到图片。请确认：右键「查看网页源代码」（不是检查元素），Ctrl+A 全选后复制。'
+        ? '源码里有分享数据，但未解析到图片或视频。请用 Ctrl+A 全选整页源码再复制（媒体数据通常在页面最底部）。'
+        : '源码中未找到图片或视频。请确认：右键「查看网页源代码」（不是检查元素），Ctrl+A 全选后复制。'
     )
     return
   }
-  if (!ensureImagesModeForLinks()) return
+  if (batch.urls.length && !ensureImagesModeForLinks()) return
 
   parsingHtml.value = true
+  htmlProgressLabel.value = ''
   linkProgressDone.value = 0
-  linkProgressTotal.value = batch.urls.length
+  linkProgressTotal.value = batch.urls.length + batch.videos.length
   const downloadedKeys = new Set<string>()
-  let added = 0
+  const downloadedVids = new Set<string>()
+  let imageAdded = 0
+  let cleanVideos = 0
+  let watermarkedVideos = 0
   try {
     for (let d = 0; d < batch.docs.length; d++) {
       const doc = batch.docs[d]
-      if (!doc.urls.length) continue
       const groupTitle = (doc.title || (batch.docCount > 1 ? `未命名对话${d + 1}` : '未命名对话')).trim()
       const titleBase = groupTitle.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 40)
       let localIdx = 0
       for (const url of doc.urls) {
-        if (tasks.value.length >= MAX_IMAGES) {
+        const imageCount = tasks.value.filter((t) => t.kind === 'image').length
+        if (imageCount >= MAX_IMAGES) {
           message.warning(`已达图片上限 ${MAX_IMAGES} 张，后续已跳过`)
           break
         }
@@ -468,27 +507,61 @@ async function onParseHtmlDraft() {
         if (downloadedKeys.has(key)) continue
         downloadedKeys.add(key)
         localIdx += 1
+        htmlProgressLabel.value = `原图 ${localIdx}`
         const filename = `${titleBase}_${localIdx}`
         try {
           const file = await downloadImageUrlToFile(url, filename)
-          if (addImageTask(file, { readyAsOriginal: true })) added += 1
+          if (addImageTask(file, { readyAsOriginal: true })) imageAdded += 1
         } catch (err) {
           const msg = err instanceof Error ? err.message : '下载失败'
           message.warning(`${filename}：${msg}`)
         }
-        linkProgressDone.value = downloadedKeys.size
+        linkProgressDone.value = downloadedKeys.size + downloadedVids.size
       }
-      if (tasks.value.length >= MAX_IMAGES) break
+
+      let videoIdx = 0
+      for (const video of doc.videos) {
+        if (downloadedVids.has(video.vid)) continue
+        downloadedVids.add(video.vid)
+        videoIdx += 1
+        const filename = `${titleBase}_视频${videoIdx}.mp4`
+        htmlProgressLabel.value = `原视频 ${videoIdx}`
+        try {
+          const play = await resolveDoubaoUnwatermarked(video.fallbackApi)
+          const clean = isDifferentMedia(play.fileHash, video.fileHash, play.quality)
+          const file = await downloadVideoUrlToFile(play.url, filename)
+          if (addReadyVideoTask(file, clean)) {
+            if (clean) cleanVideos += 1
+            else watermarkedVideos += 1
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : '下载失败'
+          if (!video.downloadUrl) {
+            message.warning(`${filename}：${msg}`)
+          } else {
+            try {
+              const file = await downloadVideoUrlToFile(video.downloadUrl, filename)
+              if (addReadyVideoTask(file, false)) watermarkedVideos += 1
+              message.warning(`${filename}：未能取得无水印原片，已保留带水印视频`)
+            } catch (fallbackErr) {
+              const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : msg
+              message.warning(`${filename}：${fallbackMsg}`)
+            }
+          }
+        }
+        linkProgressDone.value = downloadedKeys.size + downloadedVids.size
+      }
     }
+    const added = imageAdded + cleanVideos + watermarkedVideos
     if (!added) {
-      message.error('未能加入任何图片（可能被浏览器跨域拦截，可改用本地保存后上传）')
+      message.error('未能加入任何图片或视频（可能被浏览器跨域拦截，可改用本地保存后上传）')
       return
     }
-    const docHint = batch.docCount > 1 ? `（来自 ${batch.docCount} 段源码）` : ''
-    message.success(`已提取 ${added} 张无水印原图${docHint}`)
+    const summary = formatExtractSummary(imageAdded, cleanVideos, watermarkedVideos, batch.docCount)
+    message.success(summary)
     dialog.success({
       title: '提取完成',
-      content: `已得到 ${added} 张无水印原图${docHint}，可直接下载，无需再去水印。是否立即下载全部？`,
+      content: `${summary}。可直接下载，无需再去水印。是否立即下载全部？`,
       positiveText: '下载全部',
       negativeText: '先预览',
       onPositiveClick: () => {
@@ -497,7 +570,22 @@ async function onParseHtmlDraft() {
     })
   } finally {
     parsingHtml.value = false
+    htmlProgressLabel.value = ''
   }
+}
+
+function formatExtractSummary(
+  images: number,
+  cleanVideos: number,
+  watermarkedVideos: number,
+  docCount: number
+) {
+  const parts: string[] = []
+  if (images) parts.push(`${images} 张无水印原图`)
+  if (cleanVideos) parts.push(`${cleanVideos} 个无水印原视频`)
+  if (watermarkedVideos) parts.push(`${watermarkedVideos} 个视频（仍含水印）`)
+  const docHint = docCount > 1 ? `（来自 ${docCount} 段源码）` : ''
+  return `已提取 ${parts.join('、')}${docHint}`
 }
 
 async function onPasteAndFill() {
@@ -966,13 +1054,30 @@ async function downloadAll() {
   }
 }
 
+function readyStatusLabel(task: WatermarkTask) {
+  if (task.kind === 'video') return task.cleanSource === false ? '源码视频' : '无水印原视频'
+  return '无水印原图'
+}
+
+function readyPreviewLabel(task: WatermarkTask) {
+  if (task.kind === 'video') {
+    return task.cleanSource === false ? '源码视频（含水印）' : '无水印原视频'
+  }
+  return '无水印原图（点击预览）'
+}
+
+function readyDownloadLabel(task: WatermarkTask) {
+  if (task.kind === 'video') return task.cleanSource === false ? '下载视频' : '下载原视频'
+  return '下载原图'
+}
+
 function statusTag(task: WatermarkTask) {
   if (task.status === 'pending') return { type: 'default' as const, label: '待处理' }
   if (task.status === 'processing') return { type: 'info' as const, label: '处理中' }
   if (task.status === 'done') {
     return {
       type: 'success' as const,
-      label: task.readyAsOriginal ? '无水印原图' : '完成'
+      label: task.readyAsOriginal ? readyStatusLabel(task) : '完成'
     }
   }
   return { type: 'error' as const, label: '失败' }
@@ -1048,10 +1153,10 @@ onUnmounted(() => {
         </h1>
         <p class="sub">
           <template v-if="showAiLinkFetch">
-            推荐粘贴豆包网页源码在本地提取无水印原图；也支持分享链接云端拉图，或上传图片 / zip / 短视频。一次只能选一种类型。
+            推荐粘贴豆包网页源码在本地提取无水印原图和原视频；也支持分享链接云端拉图，或上传图片 / zip / 短视频。一次只能选一种类型。
           </template>
           <template v-else>
-            推荐粘贴豆包网页源码提取无水印原图；也可上传图片 / zip / 短视频。一次只能选一种类型。
+            推荐粘贴豆包网页源码提取无水印原图和原视频；也可上传图片 / zip / 短视频。一次只能选一种类型。
           </template>
         </p>
       </header>
@@ -1093,7 +1198,7 @@ onUnmounted(() => {
           v-model:value="htmlDraft"
           type="textarea"
           :autosize="{ minRows: 4, maxRows: 12 }"
-          placeholder="在此粘贴完整 HTML 源码；可连续粘贴多段（每段以 &lt;!DOCTYPE html 或 &lt;html 开头），将优先提取 image_ori_raw 无水印原图…"
+          placeholder="在此粘贴完整 HTML 源码；可连续粘贴多段（每段以 &lt;!DOCTYPE html 或 &lt;html 开头），将提取无水印原图，并解析生成视频的无水印原片…"
           :disabled="busy"
         />
         <div class="actions">
@@ -1106,7 +1211,7 @@ onUnmounted(() => {
             :disabled="busy || !hasHtmlDraft"
             @click="onParseHtmlDraft"
           >
-            {{ htmlDocCount > 1 ? `从源码提取原图（${htmlDocCount} 段）` : '从源码提取原图' }}
+            {{ htmlDocCount > 1 ? `从源码提取（${htmlDocCount} 段）` : '从源码提取' }}
           </NButton>
         </div>
       </section>
@@ -1229,7 +1334,10 @@ onUnmounted(() => {
       <section v-if="fetchingLinks || parsingHtml || linkProgressTotal" ref="linkProgressPanelRef" class="panel">
         <div class="panel-head">
           <p class="label">{{ parsingHtml ? '源码提取进度' : '拉图进度' }}</p>
-          <span class="hint-inline">{{ linkProgressDone }} / {{ linkProgressTotal }}</span>
+          <span class="hint-inline">
+            {{ linkProgressDone }} / {{ linkProgressTotal }}
+            <template v-if="parsingHtml && htmlProgressLabel"> · {{ htmlProgressLabel }}</template>
+          </span>
         </div>
         <NProgress
           type="line"
@@ -1280,7 +1388,7 @@ onUnmounted(() => {
             :disabled="busy || downloadingAll"
             @click="downloadAll"
           >
-            下载全部{{ allReadyAsOriginal ? '原图' : '结果' }}（{{ doneCount }}）
+            下载全部{{ readyDownloadNoun }}（{{ doneCount }}）
           </NButton>
         </div>
       </section>
@@ -1312,8 +1420,7 @@ onUnmounted(() => {
               保存中 {{ downloadSaveDone }}/{{ downloadSaveTotal }}
             </template>
             <template v-else>
-              下载全部{{ allReadyAsOriginal ? '原图' : '结果'
-              }}{{ doneCount ? `（${doneCount}）` : '' }}
+              下载全部{{ readyDownloadNoun }}{{ doneCount ? `（${doneCount}）` : '' }}
             </template>
           </NButton>
         </div>
@@ -1340,12 +1447,19 @@ onUnmounted(() => {
             <div v-if="task.originalUrl || task.resultUrl" class="compare-grid">
               <template v-if="task.readyAsOriginal && task.originalUrl">
                 <div class="compare-item compare-item-single">
-                  <p class="compare-label">无水印原图（点击预览）</p>
+                  <p class="compare-label">{{ readyPreviewLabel(task) }}</p>
+                  <video
+                    v-if="task.kind === 'video'"
+                    :src="task.originalUrl"
+                    controls
+                    class="preview"
+                  />
                   <NImage
+                    v-else
                     :src="task.originalUrl"
                     object-fit="contain"
                     class="preview-image"
-                    :img-props="{ alt: '无水印原图' }"
+                    :img-props="{ alt: readyPreviewLabel(task) }"
                   />
                 </div>
               </template>
@@ -1392,7 +1506,7 @@ onUnmounted(() => {
                 :disabled="downloadingAll"
                 @click="downloadTask(task)"
               >
-                {{ task.readyAsOriginal ? '下载原图' : '下载结果' }}
+                {{ task.readyAsOriginal ? readyDownloadLabel(task) : '下载结果' }}
               </NButton>
             </div>
           </article>

@@ -1,6 +1,7 @@
-/** 从豆包等分享页「网页源代码」中提取无水印原图 URL（纯前端，不经后端）。 */
+/** 从豆包等分享页「网页源代码」中提取无水印原图，以及生成视频的 fallback 地址（纯前端）。 */
 
 const MAX_IMAGES = 120
+const MAX_VIDEOS = 8
 
 const IMAGE_ORI_RAW_URL =
   /"image_ori_raw"\s*:\s*\{\s*"url"\s*:\s*"(https[^"]+)"/gi
@@ -31,8 +32,17 @@ function decodeJsString(s: string): string {
     .replace(/\\\\/g, '\\')
 }
 
+export interface DoubaoHtmlVideo {
+  vid: string
+  fallbackApi: string
+  downloadUrl: string | null
+  /** 源码里带水印档的 download_filehash，用来和 fplay 原片比对 */
+  fileHash: string | null
+}
+
 export interface DoubaoHtmlExtractResult {
   urls: string[]
+  videos: DoubaoHtmlVideo[]
   title: string | null
 }
 
@@ -40,6 +50,8 @@ export interface DoubaoHtmlBatchResult {
   docs: DoubaoHtmlExtractResult[]
   /** 跨文档去重后的全部原图 URL */
   urls: string[]
+  /** 跨文档按 vid 去重后的视频 */
+  videos: DoubaoHtmlVideo[]
   docCount: number
 }
 
@@ -91,6 +103,7 @@ export function extractDoubaoFromHtml(rawHtml: string): DoubaoHtmlExtractResult 
 
   return {
     urls,
+    videos: extractDoubaoVideos(html),
     title: extractTitle(html)
   }
 }
@@ -100,6 +113,7 @@ export function extractDoubaoFromHtmlBatch(rawHtml: string): DoubaoHtmlBatchResu
   const parts = splitHtmlDocuments(rawHtml)
   const docs: DoubaoHtmlExtractResult[] = []
   const seen = new Map<string, string>()
+  const seenVid = new Map<string, DoubaoHtmlVideo>()
 
   for (const part of parts) {
     const one = extractDoubaoFromHtml(part)
@@ -109,14 +123,63 @@ export function extractDoubaoFromHtmlBatch(rawHtml: string): DoubaoHtmlBatchResu
       if (!seen.has(key)) seen.set(key, url)
       if (seen.size >= MAX_IMAGES) break
     }
-    if (seen.size >= MAX_IMAGES) break
+    for (const video of one.videos) {
+      if (!seenVid.has(video.vid)) seenVid.set(video.vid, video)
+      if (seenVid.size >= MAX_VIDEOS) break
+    }
+    if (seen.size >= MAX_IMAGES && seenVid.size >= MAX_VIDEOS) break
   }
 
   return {
     docs,
     urls: [...seen.values()],
+    videos: [...seenVid.values()],
     docCount: parts.length
   }
+}
+
+const FALLBACK_API = /"fallback_api"\s*:\s*"(https?:\/\/[^"]+\/video\/fplay\/[^"]+)"/gi
+const DOWNLOAD_URL_IN_BLOCK = /"download_url"\s*:\s*"(https?:\/\/[^"]+)"/gi
+const FILEHASH_IN_BLOCK = /"download_filehash"\s*:\s*"([a-fA-F0-9]{32})"/gi
+
+/** 一条 creation 只保留一个 fallback_api，按 vid 去重。 */
+export function extractDoubaoVideos(html: string): DoubaoHtmlVideo[] {
+  const out: DoubaoHtmlVideo[] = []
+  const seen = new Set<string>()
+  FALLBACK_API.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = FALLBACK_API.exec(html)) !== null) {
+    const fallbackApi = cleanUrl(match[1])
+    const vid = vidFromFplay(fallbackApi || '')
+    if (!fallbackApi || !vid || seen.has(vid)) continue
+    const prev = html.lastIndexOf('"fallback_api"', match.index - 1)
+    const start = prev >= 0 ? prev : Math.max(0, match.index - 24000)
+    const block = html.slice(start, match.index)
+    seen.add(vid)
+    out.push({
+      vid,
+      fallbackApi,
+      downloadUrl: cleanUrl(lastMatch(DOWNLOAD_URL_IN_BLOCK, block) || ''),
+      fileHash: (lastMatch(FILEHASH_IN_BLOCK, block) || '').toLowerCase() || null
+    })
+    if (out.length >= MAX_VIDEOS) break
+  }
+  return out
+}
+
+function vidFromFplay(url: string): string | null {
+  const matched = /\/video\/fplay\/[^/?]+\/[^/?]+\/(v[0-9a-z]+)/i.exec(url)
+  return matched?.[1] || null
+}
+
+function lastMatch(pattern: RegExp, text: string): string | null {
+  pattern.lastIndex = 0
+  let found: string | null = null
+  let matched: RegExpExecArray | null
+  while ((matched = pattern.exec(text)) !== null) {
+    if (matched[1]) found = matched[1]
+  }
+  return found
 }
 
 /**

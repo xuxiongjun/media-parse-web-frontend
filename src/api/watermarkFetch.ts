@@ -6,6 +6,7 @@ import {
   resolveApiUrl,
   type ApiErrorBody
 } from './parse'
+import { MAX_VIDEO_BYTES } from '../utils/watermark/fileRules'
 
 export interface FetchImagesResult {
   platform: string
@@ -102,6 +103,49 @@ export async function downloadImageUrlToFile(url: string, filename: string): Pro
     }
     if (err instanceof TypeError) {
       throw new Error('浏览器无法直连图床（跨域限制），请改用本地保存后上传')
+    }
+    throw err
+  } finally {
+    window.clearTimeout(timer)
+  }
+}
+
+const VIDEO_DOWNLOAD_TIMEOUT_MS = 300_000
+
+/** 直链下载视频。豆包 CDN 允许跨域，不校验图片魔数。 */
+export async function downloadVideoUrlToFile(url: string, filename: string): Promise<File> {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), VIDEO_DOWNLOAD_TIMEOUT_MS)
+  try {
+    const res = await fetch(url, {
+      credentials: 'omit',
+      cache: 'no-store',
+      mode: 'cors',
+      referrerPolicy: 'no-referrer',
+      signal: controller.signal
+    })
+    if (!res.ok) {
+      throw new Error(`下载视频失败（${res.status}）`)
+    }
+    const buf = await res.arrayBuffer()
+    const typeHeader = (res.headers.get('content-type') || '').toLowerCase()
+    if (typeHeader.includes('text/html') || typeHeader.includes('application/json')) {
+      throw new Error('下载内容不是视频')
+    }
+    if (buf.byteLength < 32_768) {
+      throw new Error(`视频过小（${buf.byteLength}B）`)
+    }
+    if (buf.byteLength > MAX_VIDEO_BYTES) {
+      throw new Error('视频超过 80MB 上限')
+    }
+    const name = /\.mp4$/i.test(filename) ? filename : `${filename}.mp4`
+    return new File([buf], name, { type: 'video/mp4' })
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error('下载视频超时，请稍后重试')
+    }
+    if (err instanceof TypeError) {
+      throw new Error('浏览器无法直连视频地址（跨域限制）')
     }
     throw err
   } finally {
