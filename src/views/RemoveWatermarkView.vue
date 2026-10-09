@@ -561,6 +561,7 @@ async function onParseHtmlDraft() {
     message.success(summary)
     dialog.success({
       title: '提取完成',
+      maskClosable: false,
       content: `${summary}。可直接下载，无需再去水印。是否立即下载全部？`,
       positiveText: '下载全部',
       negativeText: '先预览',
@@ -770,6 +771,7 @@ async function onBatchFetchLinks() {
     if (ok && !bad) {
       dialog.info({
         title: '拉取完成',
+        maskClosable: false,
         content: `成功 ${ok} 条链接，共 ${imgTotal} 张图片。是否立即开始去水印？`,
         positiveText: '开始去水印',
         negativeText: '稍后',
@@ -780,6 +782,7 @@ async function onBatchFetchLinks() {
     } else if (ok && bad) {
       dialog.info({
         title: '拉取完成',
+        maskClosable: false,
         content: `成功 ${ok} 条（${imgTotal} 张图），失败 ${bad}。是否对已成功的图片开始去水印？`,
         positiveText: '开始去水印',
         negativeText: '稍后',
@@ -890,6 +893,7 @@ async function onStartProcess() {
   if (ok && !bad) {
     dialog.info({
       title: '去水印完成',
+      maskClosable: false,
       content: '图片已经全部处理完成，是否保存全部？',
       positiveText: '保存全部',
       negativeText: '暂不',
@@ -900,6 +904,7 @@ async function onStartProcess() {
   } else if (ok && bad) {
     dialog.info({
       title: '去水印完成',
+      maskClosable: false,
       content: `完成：成功 ${ok}，失败 ${bad}。是否保存已成功的结果？`,
       positiveText: '保存全部',
       negativeText: '暂不',
@@ -910,6 +915,7 @@ async function onStartProcess() {
   } else if (savable) {
     dialog.info({
       title: '去水印完成',
+      maskClosable: false,
       content: `本轮无新增成功项，当前仍有 ${savable} 个可保存结果。是否保存？`,
       positiveText: '保存全部',
       negativeText: '暂不',
@@ -973,6 +979,7 @@ async function downloadAll() {
       await downloadTasksWithBrowserQueue(doneTasks)
       dialog.info({
         title: '下载结果',
+        maskClosable: false,
         content: `已触发下载（${doneTasks.length} 个文件）`,
         positiveText: '知道了'
       })
@@ -993,6 +1000,7 @@ async function downloadAll() {
       await downloadTasksWithBrowserQueue(doneTasks)
       dialog.info({
         title: '下载结果',
+        maskClosable: false,
         content: `已触发下载（${doneTasks.length} 个文件）`,
         positiveText: '知道了'
       })
@@ -1033,12 +1041,14 @@ async function downloadAll() {
     if (fail === 0) {
       dialog.info({
         title: '下载结果',
+        maskClosable: false,
         content: `已保存 ${ok} 个文件到所选文件夹`,
         positiveText: '知道了'
       })
     } else {
       dialog.warning({
         title: '下载结果',
+        maskClosable: false,
         content: `成功 ${ok}，失败 ${fail}${failReasons.length ? `\n${failReasons.slice(0, 5).join('\n')}` : ''}`,
         positiveText: '知道了'
       })

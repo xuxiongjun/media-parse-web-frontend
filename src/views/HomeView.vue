@@ -518,6 +518,7 @@ async function onBatchParse() {
     if (ok && !bad) {
       dialog?.info({
         title: '解析完成',
+        maskClosable: false,
         content: '链接已经全部解析完成，是否下载全部',
         positiveText: '下载全部',
         negativeText: '暂不',
@@ -528,6 +529,7 @@ async function onBatchParse() {
     } else if (ok && bad) {
       dialog?.info({
         title: '解析完成',
+        maskClosable: false,
         content: `完成：成功 ${ok}，失败 ${bad}。是否下载已成功解析的内容？`,
         positiveText: '下载全部',
         negativeText: '暂不',
@@ -819,6 +821,7 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
     if (!freshUrls.length) {
       dialog?.info({
         title: '下载结果',
+        maskClosable: false,
         content: `全部需重新解析后仍失败，已加入失败重试列表（${failed.length}）`,
         positiveText: '知道了'
       })
@@ -829,12 +832,14 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
     if (failed.length) {
       dialog?.info({
         title: '下载结果',
+        maskClosable: false,
         content: `已触发下载 ${freshUrls.length} 个，${failed.length} 个已加入失败重试列表`,
         positiveText: '知道了'
       })
     } else {
       dialog?.info({
         title: '下载结果',
+        maskClosable: false,
         content: `已触发下载（${freshUrls.length} 个文件）`,
         positiveText: '知道了'
       })
@@ -856,6 +861,7 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
     await downloadUrlsWithQueue(jobs.map((j) => j.url))
     dialog?.info({
       title: '下载结果',
+      maskClosable: false,
       content: `已触发下载（${jobs.length} 个文件）`,
       positiveText: '知道了'
     })
@@ -874,6 +880,7 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
     syncDownloadFailsAfterSave(jobs, failed)
     dialog?.info({
       title: '下载结果',
+      maskClosable: false,
       content: `全部保存失败，已加入失败重试列表（${failed.length}）`,
       positiveText: '知道了'
     })
@@ -935,18 +942,21 @@ async function saveJobsWithLiveRefresh(jobs: DownloadJob[]): Promise<void> {
   if (failed.length === 0) {
     dialog?.info({
       title: '下载结果',
+      maskClosable: false,
       content: `已保存 ${ok} 个文件到所选文件夹`,
       positiveText: '知道了'
     })
   } else if (ok === 0) {
     dialog?.info({
       title: '下载结果',
+      maskClosable: false,
       content: `全部保存失败，已加入失败重试列表（${failed.length}）`,
       positiveText: '知道了'
     })
   } else {
     dialog?.info({
       title: '下载结果',
+      maskClosable: false,
       content: `已保存 ${ok} 个，${failed.length} 个已加入失败重试列表`,
       positiveText: '知道了'
     })
